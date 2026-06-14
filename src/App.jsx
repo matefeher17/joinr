@@ -4,6 +4,58 @@ const DEFAULT_YTDLP = "C:\\ytdlp\\yt-dlp.exe";
 const DEFAULT_FFMPEG = "C:\\ytdlp\\ffmpeg.exe";
 const DEFAULT_OUTDIR = "C:\\ytdlp\\Output";
 
+const INSTALL_BAT_CONTENT = String.raw`@echo off
+setlocal enabledelayedexpansion
+
+set "INSTALL_DIR=C:\ytdlp"
+
+if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
+
+:: --- yt-dlp ---
+if exist "%INSTALL_DIR%\yt-dlp.exe" (
+    echo yt-dlp already installed.
+) else (
+    echo Downloading yt-dlp...
+    curl -L -o "%INSTALL_DIR%\yt-dlp.exe" "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+)
+
+:: --- ffmpeg ---
+if exist "%INSTALL_DIR%\ffmpeg.exe" (
+    echo ffmpeg already installed.
+) else (
+    echo Downloading ffmpeg...
+    curl -L -o "%INSTALL_DIR%\ffmpeg.zip" "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+
+    echo Extracting ffmpeg...
+    powershell -NoProfile -Command "Expand-Archive -Path '%INSTALL_DIR%\ffmpeg.zip' -DestinationPath '%INSTALL_DIR%\ffmpeg_temp' -Force"
+
+    for /d %%D in ("%INSTALL_DIR%\ffmpeg_temp\ffmpeg-*") do (
+        copy "%%D\bin\ffmpeg.exe" "%INSTALL_DIR%\" >nul
+        copy "%%D\bin\ffprobe.exe" "%INSTALL_DIR%\" >nul
+        copy "%%D\bin\ffplay.exe" "%INSTALL_DIR%\" >nul
+    )
+
+    rmdir /s /q "%INSTALL_DIR%\ffmpeg_temp"
+    del "%INSTALL_DIR%\ffmpeg.zip"
+)
+
+:: --- Add to PATH (current user) ---
+echo Checking PATH...
+echo %PATH% | find /i "%INSTALL_DIR%" >nul
+if errorlevel 1 (
+    echo Adding %INSTALL_DIR% to user PATH...
+    setx PATH "%PATH%;%INSTALL_DIR%"
+) else (
+    echo %INSTALL_DIR% already in PATH.
+)
+
+echo.
+echo Done. Verifying installs:
+"%INSTALL_DIR%\yt-dlp.exe" --version
+"%INSTALL_DIR%\ffmpeg.exe" -version | findstr /b "ffmpeg"
+
+pause`;
+
 const ROTATIONS = [
   { value: "none",  label: "None"    },
   { value: "cw90",  label: "90° CW"  },
@@ -210,6 +262,14 @@ export default function App() {
     });
   };
 
+  const handleDownloadInstaller = () => {
+    const blob = new Blob([INSTALL_BAT_CONTENT], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "install_ytdlp.bat";
+    a.click();
+  };
+
   const sectionLabel = {
     fontSize: 12, fontWeight: 600, color: "#374151",
     textTransform: "uppercase", letterSpacing: "0.06em",
@@ -231,7 +291,7 @@ export default function App() {
       <div style={{ width: "100%", maxWidth: 560 }}>
 
         {/* Header */}
-        <div style={{ marginBottom: 32 }}>
+        <div style={{ marginBottom: 20 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
             <div style={{
               width: 36, height: 36, borderRadius: 10,
@@ -240,12 +300,48 @@ export default function App() {
               fontSize: 18,
             }}>▶</div>
             <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: "#f1f5f9", letterSpacing: "-0.3px" }}>
-              Video Joiner
+              Joinr
             </h1>
           </div>
           <p style={{ margin: 0, color: "#94a3b8", fontSize: 13.5 }}>
             Paste YouTube links → generates a .bat that downloads, joins, rotates, or trims them.
           </p>
+        </div>
+
+        {/* First-time setup banner */}
+        <div style={{
+          marginBottom: 16,
+          padding: "14px 16px",
+          background: "rgba(99, 102, 241, 0.08)",
+          border: "1px solid rgba(99, 102, 241, 0.25)",
+          borderRadius: 12,
+          display: "flex",
+          alignItems: "center",
+          gap: 14,
+        }}>
+          <div style={{ fontSize: 22, flexShrink: 0 }}>🔧</div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", display: "block", marginBottom: 3 }}>
+              First time? Install yt-dlp &amp; ffmpeg first
+            </span>
+            <span style={{ fontSize: 11.5, color: "#64748b", lineHeight: 1.5 }}>
+              Download and run{" "}
+              <code style={{
+                color: "#a5b4fc", background: "rgba(99,102,241,0.15)",
+                padding: "1px 5px", borderRadius: 4, fontSize: 11,
+              }}>install_ytdlp.bat</code>
+              {" "}once — it auto-downloads both tools and adds them to your PATH.
+            </span>
+          </div>
+          <button
+            onClick={handleDownloadInstaller}
+            style={{
+              padding: "8px 13px", fontSize: 12, fontWeight: 700, flexShrink: 0,
+              borderRadius: 8, border: "1px solid rgba(99, 102, 241, 0.4)",
+              background: "rgba(99, 102, 241, 0.15)", color: "#a5b4fc",
+              cursor: "pointer", whiteSpace: "nowrap",
+            }}
+          >⬇ install_ytdlp.bat</button>
         </div>
 
         {/* Card */}
