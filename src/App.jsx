@@ -3,6 +3,7 @@ import { useState } from "react";
 const DEFAULT_YTDLP = "C:\\ytdlp\\yt-dlp.exe";
 const DEFAULT_FFMPEG = "C:\\ytdlp\\ffmpeg.exe";
 const DEFAULT_OUTDIR = "C:\\ytdlp\\Output";
+const DEFAULT_INDIR = "C:\\Videos";
 
 const INSTALL_BAT_CONTENT = String.raw`@echo off
 setlocal enabledelayedexpansion
@@ -80,6 +81,15 @@ function isValidTime(t) {
 // ffmpeg concat demuxer single-quotes paths; escape any apostrophe as '\''
 function concatEscape(name) {
   return name.replace(/'/g, "'\\''");
+}
+
+// Turn a local file entry into a batch-ready input reference.
+// A bare filename is read from %INDIR%; an absolute path (C:\… or \\server\…)
+// is used verbatim so files can be pulled from anywhere.
+function toInputRef(name) {
+  const n = name.trim();
+  if (/^[a-zA-Z]:[\\/]/.test(n) || /^\\\\/.test(n)) return n;
+  return `%INDIR%\\${n}`;
 }
 
 function downloadText(filename, content) {
@@ -240,6 +250,46 @@ del ${delParts}`;
   return `${header}\n${body}`;
 }
 
+// Local mode — one output's worth of lines for files already on disk.
+// Inputs are the user's originals and are NEVER deleted (only the temp
+// filelist.txt is removed).
+function buildLocalSection({ safe, refs, rotation, trimStart, trimEnd, idx }) {
+  const single = refs.length === 1;
+  const needsReencode = rotation !== "none";
+  const hasTrim       = !!(trimStart?.trim() || trimEnd?.trim());
+  const hasProcessing = needsReencode || hasTrim;
+
+  const vfMap = { cw90: "transpose=1", ccw90: "transpose=2", "180": "vflip,hflip" };
+  const vfArg     = needsReencode ? `-vf "${vfMap[rotation]}" ` : "";
+  const codecArgs = needsReencode ? "-c:v libx264 -c:a aac" : "-c copy";
+
+  let trimArgs = "";
+  if (trimStart?.trim()) trimArgs += `-ss ${trimStart.trim()} `;
+  if (trimEnd?.trim())   trimArgs += `-to ${trimEnd.trim()} `;
+
+  const header = `REM ===== Output ${idx}: ${safe} (${single ? "1 file" : refs.length + " files joined"}) =====`;
+
+  if (single && !hasProcessing) {
+    // Nothing to join or change — just copy the source to the output name/folder.
+    return `${header}
+echo === Copying: ${safe} ===
+copy "${refs[0]}" "${safe}.mp4"`;
+  }
+  if (single) {
+    return `${header}
+echo === Processing: ${safe} ===
+%FFMPEG% -i "${refs[0]}" ${trimArgs}${vfArg}${codecArgs} "${safe}.mp4"`;
+  }
+  const fileLines = refs.map(r => `echo file '${concatEscape(r)}'`).join("\n");
+  return `${header}
+echo === Joining${hasProcessing ? " and processing" : ""} ${refs.length} files: ${safe} ===
+(
+${fileLines}
+) > filelist.txt
+%FFMPEG% -f concat -safe 0 -i filelist.txt ${trimArgs}${vfArg}${codecArgs} "${safe}.mp4"
+del filelist.txt`;
+}
+
 // Links mode — one or many videos, each downloaded and joined into its own file.
 function generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd }) {
   const complete = groups
@@ -265,6 +315,41 @@ if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 cd /d "%OUTDIR%"
 
 set FMT=bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b
+
+${blocks}
+
+${footer}
+`;
+}
+
+// Local mode — process files already on the machine (join / rotate / trim).
+function generateLocalBatch({ groups, ffmpeg, indir, outdir, rotation, trimStart, trimEnd }) {
+  const complete = groups
+    .map(g => ({
+      safe: sanitizeFilename(g.name) || "output",
+      refs: g.files.map(f => f.trim()).filter(Boolean).map(f => toInputRef(f)),
+    }))
+    .filter(g => g.refs.length > 0);
+
+  const blocks = complete
+    .map((g, i) => buildLocalSection({ safe: g.safe, refs: g.refs, rotation, trimStart, trimEnd, idx: i + 1 }))
+    .join("\n\n");
+
+  const footer = complete.length === 1
+    ? `echo.\necho Done! Output: ${complete[0].safe}.mp4\npause`
+    : `echo.\necho All done! ${complete.length} file(s) created in "%OUTDIR%".\npause`;
+
+  return `@echo off
+setlocal
+
+set FFMPEG=${ffmpeg}
+set INDIR=${indir}
+set OUTDIR=${outdir}
+
+if not exist "%OUTDIR%" mkdir "%OUTDIR%"
+cd /d "%OUTDIR%"
+
+REM Source files are read from %INDIR% and never modified or deleted.
 
 ${blocks}
 
@@ -383,7 +468,8 @@ function OutputPanel({ filename, content }) {
   );
 }
 
-function UrlRow({ index, value, onChange, onRemove, canRemove }) {
+function UrlRow({ index, value, onChange, onRemove, canRemove, placeholder = "https://youtu.be/…", validate = isYouTubeUrl }) {
+  const invalid = value && !validate(value);
   return (
     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
       <span style={{ fontSize: 11, fontWeight: 700, color: "#6b7280", minWidth: 24, textAlign: "right", fontFamily: "monospace" }}>
@@ -393,11 +479,11 @@ function UrlRow({ index, value, onChange, onRemove, canRemove }) {
         type="text"
         value={value}
         onChange={e => onChange(e.target.value)}
-        placeholder="https://youtu.be/…"
+        placeholder={placeholder}
         style={{
           flex: 1, padding: "9px 12px", fontSize: 13, fontFamily: "monospace",
           border: "1.5px solid",
-          borderColor: value && !isYouTubeUrl(value) ? "#f87171" : "#d1d5db",
+          borderColor: invalid ? "#f87171" : "#d1d5db",
           borderRadius: 8, outline: "none", background: "#fafafa",
           transition: "border-color 0.15s", color: "#111",
         }}
@@ -429,6 +515,55 @@ function TimeInput({ label, value, onChange, placeholder }) {
           borderRadius: 8, outline: "none", background: "#fff", color: "#111", transition: "border-color 0.15s",
         }}
       />
+    </div>
+  );
+}
+
+// Rotation + trim controls, shared by Links and Local modes.
+function TransformPanel({ rotation, setRotation, trimStart, setTrimStart, trimEnd, setTrimEnd, onChange, multi }) {
+  const timesValid = isValidTime(trimStart) && isValidTime(trimEnd);
+  return (
+    <div style={{ marginBottom: 16, padding: "14px 16px", background: "#f8fafc", borderRadius: 10, border: "1px solid #e5e7eb" }}>
+      <span style={{ ...sectionLabel, marginBottom: multi ? 8 : 14 }}>Transform</span>
+      {multi && (
+        <p style={{ margin: "0 0 14px", fontSize: 11, color: "#9ca3af", lineHeight: 1.5 }}>
+          With multiple videos, rotation and trim are applied to every output. Leave blank for a plain join.
+        </p>
+      )}
+      <div style={{ marginBottom: 16 }}>
+        <span style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", display: "block", marginBottom: 8 }}>Rotation</span>
+        <div style={{ display: "flex", gap: 6 }}>
+          {ROTATIONS.map(opt => {
+            const active = rotation === opt.value;
+            return (
+              <button
+                key={opt.value}
+                onClick={() => { setRotation(opt.value); onChange(); }}
+                style={{ flex: 1, padding: "7px 0", fontSize: 12.5, fontWeight: 600, borderRadius: 7, border: "1.5px solid", borderColor: active ? "#6366f1" : "#d1d5db", background: active ? "#eef2ff" : "#fff", color: active ? "#4338ca" : "#6b7280", cursor: "pointer", transition: "all 0.12s" }}
+              >{opt.label}</button>
+            );
+          })}
+        </div>
+        {rotation !== "none" && (
+          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#7c3aed" }}>⚠ Re-encodes with libx264 — slower than stream copy</p>
+        )}
+      </div>
+      <div>
+        <span style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", display: "block", marginBottom: 8 }}>
+          Trim <span style={{ fontWeight: 400 }}>— leave blank to keep full length</span>
+        </span>
+        <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+          <TimeInput label="Start time" value={trimStart} onChange={v => { setTrimStart(v); onChange(); }} placeholder="0:30" />
+          <span style={{ color: "#d1d5db", paddingBottom: 11, fontSize: 18 }}>→</span>
+          <TimeInput label="End time" value={trimEnd} onChange={v => { setTrimEnd(v); onChange(); }} placeholder="1:45:00" />
+        </div>
+        {(trimStart || trimEnd) && !timesValid && (
+          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#f87171" }}>Use M:SS or H:MM:SS (e.g. 1:30 or 0:01:30)</p>
+        )}
+        {(trimStart || trimEnd) && timesValid && rotation === "none" && (
+          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#6b7280" }}>Trim without rotation uses stream copy — cuts at nearest keyframe</p>
+        )}
+      </div>
     </div>
   );
 }
@@ -477,6 +612,63 @@ function LinksVideo({ group, index, canRemove, onName, onUrl, onAddUrl, onRemove
         onClick={onAddUrl}
         style={{ marginTop: 10, padding: "7px 14px", fontSize: 12.5, border: "1.5px dashed #c4b5fd", borderRadius: 8, background: "#faf5ff", color: "#7c3aed", cursor: "pointer", fontWeight: 600, width: "100%" }}
       >+ Add another part</button>
+    </div>
+  );
+}
+
+// One video in Local mode: its own output name + ordered source files on disk.
+function LocalVideo({ group, index, canRemove, onName, onFile, onAddFile, onRemoveFile, onRemove }) {
+  const filled = group.files.filter(f => f.trim());
+  const safe = sanitizeFilename(group.name) || "output";
+  const count = filled.length;
+  return (
+    <div style={{ padding: "14px 16px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+          Video {index + 1}{count > 1 ? ` · ${count} files` : ""}
+        </span>
+        {canRemove && (
+          <button
+            onClick={onRemove}
+            title="Remove this video"
+            style={{ border: "none", background: "#fee2e2", color: "#dc2626", borderRadius: 6, fontSize: 11, fontWeight: 600, padding: "4px 9px", cursor: "pointer" }}
+          >Remove video</button>
+        )}
+      </div>
+
+      <input
+        type="text"
+        value={group.name}
+        onChange={e => onName(e.target.value)}
+        placeholder="Output filename — e.g. Full match joined"
+        style={{ display: "block", width: "100%", boxSizing: "border-box", padding: "9px 12px", fontSize: 13.5, border: "1.5px solid #d1d5db", borderRadius: 8, outline: "none", background: "#fafafa", color: "#111", marginBottom: group.name ? 4 : 12 }}
+      />
+      {group.name && (
+        <span style={{ fontSize: 11, color: "#6b7280", marginBottom: 12, display: "block" }}>→ {safe}.mp4</span>
+      )}
+
+      <span style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", display: "block", marginBottom: 8 }}>
+        Source files{" "}
+        <span style={{ fontWeight: 400 }}>{count <= 1 ? "(single file works fine)" : "(in order)"}</span>
+      </span>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {group.files.map((file, i) => (
+          <UrlRow
+            key={i}
+            index={i}
+            value={file}
+            onChange={v => onFile(i, v)}
+            onRemove={() => onRemoveFile(i)}
+            canRemove={group.files.length > 1}
+            placeholder="match part 1.mp4   (or a full path)"
+            validate={() => true}
+          />
+        ))}
+      </div>
+      <button
+        onClick={onAddFile}
+        style={{ marginTop: 10, padding: "7px 14px", fontSize: 12.5, border: "1.5px dashed #c4b5fd", borderRadius: 8, background: "#faf5ff", color: "#7c3aed", cursor: "pointer", fontWeight: 600, width: "100%" }}
+      >+ Add another file</button>
     </div>
   );
 }
@@ -533,6 +725,9 @@ function JobCard({ job, jobs, items, onRename, onToggle, onMoveItem, onReassign,
 let groupSeq = 1;
 const newGroup = () => ({ id: "g" + (groupSeq++), name: "", urls: ["", ""] });
 
+let localSeq = 1;
+const newLocalGroup = () => ({ id: "l" + (localSeq++), name: "", files: ["", ""] });
+
 export default function App() {
   const [mode, setMode] = useState("links");
 
@@ -548,6 +743,14 @@ export default function App() {
   const [trimStart, setTrimStart] = useState("");
   const [trimEnd, setTrimEnd]     = useState("");
   const [linksBat, setLinksBat]   = useState(null);
+
+  // Local mode — files already on the machine
+  const [indir, setIndir]                   = useState(DEFAULT_INDIR);
+  const [localGroups, setLocalGroups]       = useState([newLocalGroup()]);
+  const [localRotation, setLocalRotation]   = useState("none");
+  const [localTrimStart, setLocalTrimStart] = useState("");
+  const [localTrimEnd, setLocalTrimEnd]     = useState("");
+  const [localBat, setLocalBat]             = useState(null);
 
   // Playlist mode
   const [playlistUrl, setPlaylistUrl] = useState("");
@@ -591,6 +794,45 @@ export default function App() {
     completeCount === 0 ? "Each video needs a name and at least one valid YouTube URL" :
     anyIncomplete       ? "Finish or remove the incomplete video (needs a name + valid links)" :
     !timesValid         ? "Fix time format (M:SS or H:MM:SS)" : "";
+
+  // ── Local handlers ──
+  const invalidateLocal = () => setLocalBat(null);
+  const setLocalName    = (id, name)   => { setLocalGroups(p => p.map(g => g.id === id ? { ...g, name } : g)); invalidateLocal(); };
+  const setLocalFile    = (id, i, val) => { setLocalGroups(p => p.map(g => g.id === id ? { ...g, files: g.files.map((f, j) => j === i ? val : f) } : g)); invalidateLocal(); };
+  const addLocalFile    = (id)         => { setLocalGroups(p => p.map(g => g.id === id ? { ...g, files: [...g.files, ""] } : g)); invalidateLocal(); };
+  const removeLocalFile = (id, i)      => { setLocalGroups(p => p.map(g => g.id === id ? { ...g, files: g.files.filter((_, j) => j !== i) } : g)); invalidateLocal(); };
+  const addLocalGroup   = ()           => { setLocalGroups(p => [...p, newLocalGroup()]); invalidateLocal(); };
+  const removeLocalGroup = (id)        => { setLocalGroups(p => p.filter(g => g.id !== id)); invalidateLocal(); };
+
+  const localStatuses = localGroups.map(g => {
+    const filled = g.files.filter(f => f.trim());
+    const empty = !g.name.trim() && filled.length === 0;
+    const complete = !!g.name.trim() && filled.length >= 1;
+    return { empty, complete };
+  });
+  const localCompleteCount = localStatuses.filter(s => s.complete).length;
+  const localAnyIncomplete = localStatuses.some(s => !s.empty && !s.complete);
+  const localTimesValid    = isValidTime(localTrimStart) && isValidTime(localTrimEnd);
+  const localCanGenerate   = localCompleteCount >= 1 && !localAnyIncomplete && localTimesValid && !!indir.trim();
+  const localMulti         = localGroups.length > 1;
+
+  const firstLocalCompleteIdx = localStatuses.findIndex(s => s.complete);
+  const localFilename = localCompleteCount === 1 && firstLocalCompleteIdx >= 0
+    ? `${sanitizeFilename(localGroups[firstLocalCompleteIdx].name) || "output"}_join.bat`
+    : "batch_join_local.bat";
+
+  const handleGenerateLocal = () =>
+    setLocalBat(generateLocalBatch({ groups: localGroups, ffmpeg, indir, outdir, rotation: localRotation, trimStart: localTrimStart, trimEnd: localTrimEnd }));
+
+  const sameFolder =
+    indir.trim() && outdir.trim() &&
+    indir.trim().replace(/[\\/]+$/, "").toLowerCase() === outdir.trim().replace(/[\\/]+$/, "").toLowerCase();
+
+  const localHint =
+    localCompleteCount === 0 ? "Each video needs a name and at least one source file" :
+    localAnyIncomplete       ? "Finish or remove the incomplete video (needs a name + at least one file)" :
+    !indir.trim()            ? "Set the folder containing your videos" :
+    !localTimesValid         ? "Fix time format (M:SS or H:MM:SS)" : "";
 
   // ── Playlist handlers ──
   const invalidateJoin = () => setJoinBat(null);
@@ -637,6 +879,13 @@ export default function App() {
     );
   };
 
+  const pathRows = mode === "local"
+    ? [["ffmpeg path", ffmpeg, setFfmpeg], ["Output folder", outdir, setOutdir]]
+    : [["yt-dlp path", ytdlp, setYtdlp], ["ffmpeg path", ffmpeg, setFfmpeg], ["Output folder", outdir, setOutdir]];
+  const pathsLabel = mode === "local"
+    ? "Paths (ffmpeg, output folder)"
+    : "Paths (yt-dlp, ffmpeg, output folder)";
+
   const pathsAdvanced = (
     <div style={{ marginBottom: 20 }}>
       <button
@@ -644,21 +893,17 @@ export default function App() {
         style={{ background: "none", border: "none", padding: 0, fontSize: 12, color: "#6b7280", cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}
       >
         <span style={{ transform: showAdvanced ? "rotate(90deg)" : "none", display: "inline-block", transition: "transform 0.15s" }}>▶</span>
-        Paths (yt-dlp, ffmpeg, output folder)
+        {pathsLabel}
       </button>
       {showAdvanced && (
         <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
-          {[
-            ["yt-dlp path",   ytdlp,  setYtdlp],
-            ["ffmpeg path",   ffmpeg, setFfmpeg],
-            ["Output folder", outdir, setOutdir],
-          ].map(([label, val, setter]) => (
+          {pathRows.map(([label, val, setter]) => (
             <label key={label} style={{ display: "block" }}>
               <span style={{ fontSize: 11, color: "#6b7280", fontWeight: 600 }}>{label}</span>
               <input
                 type="text"
                 value={val}
-                onChange={e => { setter(e.target.value); invalidateLinks(); invalidateJoin(); }}
+                onChange={e => { setter(e.target.value); invalidateLinks(); invalidateJoin(); invalidateLocal(); }}
                 style={{ display: "block", width: "100%", marginTop: 4, padding: "7px 10px", fontSize: 12, boxSizing: "border-box", fontFamily: "monospace", border: "1.5px solid #e5e7eb", borderRadius: 6, background: "#f9fafb", color: "#374151", outline: "none" }}
               />
             </label>
@@ -684,7 +929,7 @@ export default function App() {
             <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: "#f1f5f9", letterSpacing: "-0.3px" }}>Joinr</h1>
           </div>
           <p style={{ margin: 0, color: "#94a3b8", fontSize: 13.5 }}>
-            Paste YouTube links → generates a .bat that downloads, joins, rotates, or trims them.
+            Paste YouTube links — or point at files on your machine — and get a .bat that joins, rotates, or trims them.
           </p>
         </div>
 
@@ -692,6 +937,7 @@ export default function App() {
         <div style={{ display: "flex", gap: 4, padding: 4, marginBottom: 16, background: "rgba(15,23,42,0.6)", border: "1px solid #1e293b", borderRadius: 12 }}>
           {modeButton("links", "Links")}
           {modeButton("playlist", "Playlist")}
+          {modeButton("local", "Local files")}
         </div>
 
         {/* First-time setup banner */}
@@ -699,7 +945,9 @@ export default function App() {
           <div style={{ fontSize: 22, flexShrink: 0 }}>🔧</div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <span style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", display: "block", marginBottom: 3 }}>
-              First time? Install yt-dlp &amp; ffmpeg first
+              {mode === "local"
+                ? "Local files only need ffmpeg"
+                : "First time? Install yt-dlp \u0026 ffmpeg first"}
             </span>
             <span style={{ fontSize: 11.5, color: "#64748b", lineHeight: 1.5 }}>
               Download and run{" "}
@@ -744,49 +992,12 @@ export default function App() {
                 >+ Add another video</button>
               </div>
 
-              {/* Transform */}
-              <div style={{ marginBottom: 16, padding: "14px 16px", background: "#f8fafc", borderRadius: 10, border: "1px solid #e5e7eb" }}>
-                <span style={{ ...sectionLabel, marginBottom: multi ? 8 : 14 }}>Transform</span>
-                {multi && (
-                  <p style={{ margin: "0 0 14px", fontSize: 11, color: "#9ca3af", lineHeight: 1.5 }}>
-                    With multiple videos, rotation and trim are applied to every output. Leave blank for a plain join.
-                  </p>
-                )}
-                <div style={{ marginBottom: 16 }}>
-                  <span style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", display: "block", marginBottom: 8 }}>Rotation</span>
-                  <div style={{ display: "flex", gap: 6 }}>
-                    {ROTATIONS.map(opt => {
-                      const active = rotation === opt.value;
-                      return (
-                        <button
-                          key={opt.value}
-                          onClick={() => { setRotation(opt.value); invalidateLinks(); }}
-                          style={{ flex: 1, padding: "7px 0", fontSize: 12.5, fontWeight: 600, borderRadius: 7, border: "1.5px solid", borderColor: active ? "#6366f1" : "#d1d5db", background: active ? "#eef2ff" : "#fff", color: active ? "#4338ca" : "#6b7280", cursor: "pointer", transition: "all 0.12s" }}
-                        >{opt.label}</button>
-                      );
-                    })}
-                  </div>
-                  {rotation !== "none" && (
-                    <p style={{ margin: "7px 0 0", fontSize: 11, color: "#7c3aed" }}>⚠ Re-encodes with libx264 — slower than stream copy</p>
-                  )}
-                </div>
-                <div>
-                  <span style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", display: "block", marginBottom: 8 }}>
-                    Trim <span style={{ fontWeight: 400 }}>— leave blank to keep full length</span>
-                  </span>
-                  <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
-                    <TimeInput label="Start time" value={trimStart} onChange={v => { setTrimStart(v); invalidateLinks(); }} placeholder="0:30" />
-                    <span style={{ color: "#d1d5db", paddingBottom: 11, fontSize: 18 }}>→</span>
-                    <TimeInput label="End time" value={trimEnd} onChange={v => { setTrimEnd(v); invalidateLinks(); }} placeholder="1:45:00" />
-                  </div>
-                  {(trimStart || trimEnd) && !timesValid && (
-                    <p style={{ margin: "7px 0 0", fontSize: 11, color: "#f87171" }}>Use M:SS or H:MM:SS (e.g. 1:30 or 0:01:30)</p>
-                  )}
-                  {(trimStart || trimEnd) && timesValid && rotation === "none" && (
-                    <p style={{ margin: "7px 0 0", fontSize: 11, color: "#6b7280" }}>Trim without rotation uses stream copy — cuts at nearest keyframe</p>
-                  )}
-                </div>
-              </div>
+              <TransformPanel
+                rotation={rotation} setRotation={setRotation}
+                trimStart={trimStart} setTrimStart={setTrimStart}
+                trimEnd={trimEnd} setTrimEnd={setTrimEnd}
+                onChange={invalidateLinks} multi={multi}
+              />
 
               {pathsAdvanced}
 
@@ -803,6 +1014,83 @@ export default function App() {
             </div>
 
             {linksBat && <OutputPanel filename={linksFilename} content={linksBat} />}
+          </>
+        )}
+
+        {/* ─── LOCAL MODE ─── */}
+        {mode === "local" && (
+          <>
+            <div style={{ background: "#fff", borderRadius: 16, padding: 28, boxShadow: "0 4px 32px rgba(0,0,0,0.25)" }}>
+
+              {/* Input folder */}
+              <div style={{ marginBottom: 20 }}>
+                <span style={{ ...sectionLabel, marginBottom: 6 }}>Folder containing your videos</span>
+                <p style={{ margin: "0 0 10px", fontSize: 12, color: "#9ca3af", lineHeight: 1.5 }}>
+                  The folder your source files already live in. Below, list each file by name — or paste a full path to pull a file from anywhere.
+                </p>
+                <input
+                  type="text"
+                  value={indir}
+                  onChange={e => { setIndir(e.target.value); invalidateLocal(); }}
+                  placeholder="C:\Videos"
+                  style={{ display: "block", width: "100%", boxSizing: "border-box", padding: "9px 12px", fontSize: 13, fontFamily: "monospace", border: "1.5px solid #d1d5db", borderRadius: 8, outline: "none", background: "#fafafa", color: "#111" }}
+                />
+                {sameFolder && (
+                  <p style={{ margin: "7px 0 0", fontSize: 11, color: "#6b7280" }}>
+                    Output folder is the same as this one — results land alongside your originals. Your source files are never deleted.
+                  </p>
+                )}
+              </div>
+
+              {/* Videos */}
+              <div style={{ marginBottom: 16 }}>
+                <span style={{ ...sectionLabel, marginBottom: 4 }}>Videos</span>
+                <p style={{ margin: "0 0 12px", fontSize: 12, color: "#9ca3af", lineHeight: 1.5 }}>
+                  Each video below becomes its own output file. Add files within a video to join them in order; add more videos to process several in one run.
+                </p>
+                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  {localGroups.map((g, i) => (
+                    <LocalVideo
+                      key={g.id}
+                      group={g}
+                      index={i}
+                      canRemove={localGroups.length > 1}
+                      onName={name => setLocalName(g.id, name)}
+                      onFile={(j, v) => setLocalFile(g.id, j, v)}
+                      onAddFile={() => addLocalFile(g.id)}
+                      onRemoveFile={j => removeLocalFile(g.id, j)}
+                      onRemove={() => removeLocalGroup(g.id)}
+                    />
+                  ))}
+                </div>
+                <button
+                  onClick={addLocalGroup}
+                  style={{ marginTop: 12, padding: "9px 14px", fontSize: 13, border: "1.5px solid #c4b5fd", borderRadius: 8, background: "#f5f3ff", color: "#6d28d9", cursor: "pointer", fontWeight: 700, width: "100%" }}
+                >+ Add another video</button>
+              </div>
+
+              <TransformPanel
+                rotation={localRotation} setRotation={setLocalRotation}
+                trimStart={localTrimStart} setTrimStart={setLocalTrimStart}
+                trimEnd={localTrimEnd} setTrimEnd={setLocalTrimEnd}
+                onChange={invalidateLocal} multi={localMulti}
+              />
+
+              {pathsAdvanced}
+
+              <button
+                onClick={handleGenerateLocal}
+                disabled={!localCanGenerate}
+                style={{ width: "100%", padding: "11px 0", fontSize: 14, fontWeight: 700, borderRadius: 10, border: "none", cursor: localCanGenerate ? "pointer" : "not-allowed", background: localCanGenerate ? "linear-gradient(135deg, #6366f1, #818cf8)" : "#e5e7eb", color: localCanGenerate ? "#fff" : "#9ca3af", transition: "opacity 0.15s" }}
+              >
+                {localCanGenerate && localCompleteCount > 1 ? `Generate script (${localCompleteCount} files)` : "Generate script"}
+              </button>
+              {!localCanGenerate && (
+                <p style={{ margin: "8px 0 0", fontSize: 11.5, color: "#9ca3af", textAlign: "center" }}>{localHint}</p>
+              )}
+            </div>
+
+            {localBat && <OutputPanel filename={localFilename} content={localBat} />}
           </>
         )}
 
@@ -917,7 +1205,9 @@ export default function App() {
         )}
 
         <p style={{ marginTop: 16, fontSize: 11, color: "#475569", textAlign: "center" }}>
-          Requires yt-dlp + ffmpeg · One file per video · Joins use stream copy unless rotating
+          {mode === "local"
+            ? "Requires ffmpeg · Works on files already on your machine · Originals never deleted · Joins use stream copy unless rotating"
+            : "Requires yt-dlp + ffmpeg · One file per video · Joins use stream copy unless rotating"}
         </p>
 
       </div>
