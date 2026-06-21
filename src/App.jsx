@@ -64,6 +64,13 @@ const ROTATIONS = [
   { value: "180",   label: "180°"    },
 ];
 
+const FLIPS = [
+  { value: "none", label: "None"       },
+  { value: "h",    label: "Horizontal" },
+  { value: "v",    label: "Vertical"   },
+  { value: "both", label: "Both"       },
+];
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function isYouTubeUrl(url) {
@@ -198,15 +205,28 @@ function buildInitial(videos) {
 
 // ─── Batch generators ────────────────────────────────────────────────────────
 
+// Build the ffmpeg -vf filter chain from rotation + flip selections. Rotation
+// filters come first, then horizontal/vertical mirrors. A non-empty chain means
+// we must re-encode — stream copy can't transform pixels.
+function buildVf(rotation, flip) {
+  const filters = [];
+  if (rotation === "cw90")       filters.push("transpose=1");
+  else if (rotation === "ccw90") filters.push("transpose=2");
+  else if (rotation === "180")   filters.push("vflip", "hflip");
+  if (flip === "h" || flip === "both") filters.push("hflip");
+  if (flip === "v" || flip === "both") filters.push("vflip");
+  return filters;
+}
+
 // One output's worth of batch lines: download parts, then join / rename / process.
-function buildVideoSection({ safe, urls, rotation, trimStart, trimEnd, idx }) {
+function buildVideoSection({ safe, urls, rotation, flip, trimStart, trimEnd, idx }) {
   const single = urls.length === 1;
-  const needsReencode = rotation !== "none";
+  const vfFilters     = buildVf(rotation, flip);
+  const needsReencode = vfFilters.length > 0;
   const hasTrim       = !!(trimStart?.trim() || trimEnd?.trim());
   const hasProcessing = needsReencode || hasTrim;
 
-  const vfMap = { cw90: "transpose=1", ccw90: "transpose=2", "180": "vflip,hflip" };
-  const vfArg     = needsReencode ? `-vf "${vfMap[rotation]}" ` : "";
+  const vfArg     = needsReencode ? `-vf "${vfFilters.join(",")}" ` : "";
   const codecArgs = needsReencode ? "-c:v libx264 -c:a aac" : "-c copy";
 
   let trimArgs = "";
@@ -253,14 +273,14 @@ del ${delParts}`;
 // Local mode — one output's worth of lines for files already on disk.
 // Inputs are the user's originals and are NEVER deleted (only the temp
 // filelist.txt is removed).
-function buildLocalSection({ safe, refs, rotation, trimStart, trimEnd, idx }) {
+function buildLocalSection({ safe, refs, rotation, flip, trimStart, trimEnd, idx }) {
   const single = refs.length === 1;
-  const needsReencode = rotation !== "none";
+  const vfFilters     = buildVf(rotation, flip);
+  const needsReencode = vfFilters.length > 0;
   const hasTrim       = !!(trimStart?.trim() || trimEnd?.trim());
   const hasProcessing = needsReencode || hasTrim;
 
-  const vfMap = { cw90: "transpose=1", ccw90: "transpose=2", "180": "vflip,hflip" };
-  const vfArg     = needsReencode ? `-vf "${vfMap[rotation]}" ` : "";
+  const vfArg     = needsReencode ? `-vf "${vfFilters.join(",")}" ` : "";
   const codecArgs = needsReencode ? "-c:v libx264 -c:a aac" : "-c copy";
 
   let trimArgs = "";
@@ -291,13 +311,13 @@ del filelist.txt`;
 }
 
 // Links mode — one or many videos, each downloaded and joined into its own file.
-function generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd }) {
+function generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, flip, trimStart, trimEnd }) {
   const complete = groups
     .map(g => ({ safe: sanitizeFilename(g.name) || "output", urls: g.urls.filter(u => u.trim()) }))
     .filter(g => g.urls.length > 0);
 
   const blocks = complete
-    .map((g, i) => buildVideoSection({ safe: g.safe, urls: g.urls, rotation, trimStart, trimEnd, idx: i + 1 }))
+    .map((g, i) => buildVideoSection({ safe: g.safe, urls: g.urls, rotation, flip, trimStart, trimEnd, idx: i + 1 }))
     .join("\n\n");
 
   const footer = complete.length === 1
@@ -323,7 +343,7 @@ ${footer}
 }
 
 // Local mode — process files already on the machine (join / rotate / trim).
-function generateLocalBatch({ groups, ffmpeg, indir, outdir, rotation, trimStart, trimEnd }) {
+function generateLocalBatch({ groups, ffmpeg, indir, outdir, rotation, flip, trimStart, trimEnd }) {
   const complete = groups
     .map(g => ({
       safe: sanitizeFilename(g.name) || "output",
@@ -332,7 +352,7 @@ function generateLocalBatch({ groups, ffmpeg, indir, outdir, rotation, trimStart
     .filter(g => g.refs.length > 0);
 
   const blocks = complete
-    .map((g, i) => buildLocalSection({ safe: g.safe, refs: g.refs, rotation, trimStart, trimEnd, idx: i + 1 }))
+    .map((g, i) => buildLocalSection({ safe: g.safe, refs: g.refs, rotation, flip, trimStart, trimEnd, idx: i + 1 }))
     .join("\n\n");
 
   const footer = complete.length === 1
@@ -519,15 +539,16 @@ function TimeInput({ label, value, onChange, placeholder }) {
   );
 }
 
-// Rotation + trim controls, shared by Links and Local modes.
-function TransformPanel({ rotation, setRotation, trimStart, setTrimStart, trimEnd, setTrimEnd, onChange, multi }) {
+// Rotation + mirror + trim controls, shared by Links and Local modes.
+function TransformPanel({ rotation, setRotation, flip, setFlip, trimStart, setTrimStart, trimEnd, setTrimEnd, onChange, multi }) {
   const timesValid = isValidTime(trimStart) && isValidTime(trimEnd);
+  const reencodes  = rotation !== "none" || flip !== "none";
   return (
     <div style={{ marginBottom: 16, padding: "14px 16px", background: "#f8fafc", borderRadius: 10, border: "1px solid #e5e7eb" }}>
       <span style={{ ...sectionLabel, marginBottom: multi ? 8 : 14 }}>Transform</span>
       {multi && (
         <p style={{ margin: "0 0 14px", fontSize: 11, color: "#9ca3af", lineHeight: 1.5 }}>
-          With multiple videos, rotation and trim are applied to every output. Leave blank for a plain join.
+          With multiple videos, rotation, mirror, and trim are applied to every output. Leave blank for a plain join.
         </p>
       )}
       <div style={{ marginBottom: 16 }}>
@@ -544,8 +565,25 @@ function TransformPanel({ rotation, setRotation, trimStart, setTrimStart, trimEn
             );
           })}
         </div>
-        {rotation !== "none" && (
-          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#7c3aed" }}>⚠ Re-encodes with libx264 — slower than stream copy</p>
+      </div>
+      <div style={{ marginBottom: 16 }}>
+        <span style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", display: "block", marginBottom: 8 }}>
+          Mirror / Flip <span style={{ fontWeight: 400 }}>— Horizontal fixes a mirrored video</span>
+        </span>
+        <div style={{ display: "flex", gap: 6 }}>
+          {FLIPS.map(opt => {
+            const active = flip === opt.value;
+            return (
+              <button
+                key={opt.value}
+                onClick={() => { setFlip(opt.value); onChange(); }}
+                style={{ flex: 1, whiteSpace: "nowrap", padding: "7px 0", fontSize: 12.5, fontWeight: 600, borderRadius: 7, border: "1.5px solid", borderColor: active ? "#6366f1" : "#d1d5db", background: active ? "#eef2ff" : "#fff", color: active ? "#4338ca" : "#6b7280", cursor: "pointer", transition: "all 0.12s" }}
+              >{opt.label}</button>
+            );
+          })}
+        </div>
+        {reencodes && (
+          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#7c3aed" }}>⚠ Rotation/mirroring re-encodes with libx264 — slower than stream copy</p>
         )}
       </div>
       <div>
@@ -560,8 +598,8 @@ function TransformPanel({ rotation, setRotation, trimStart, setTrimStart, trimEn
         {(trimStart || trimEnd) && !timesValid && (
           <p style={{ margin: "7px 0 0", fontSize: 11, color: "#f87171" }}>Use M:SS or H:MM:SS (e.g. 1:30 or 0:01:30)</p>
         )}
-        {(trimStart || trimEnd) && timesValid && rotation === "none" && (
-          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#6b7280" }}>Trim without rotation uses stream copy — cuts at nearest keyframe</p>
+        {(trimStart || trimEnd) && timesValid && !reencodes && (
+          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#6b7280" }}>Trim without rotation or mirroring uses stream copy — cuts at nearest keyframe</p>
         )}
       </div>
     </div>
@@ -740,6 +778,7 @@ export default function App() {
   // Links mode — a list of videos, each with its own name + parts
   const [groups, setGroups]       = useState([newGroup()]);
   const [rotation, setRotation]   = useState("none");
+  const [flip, setFlip]           = useState("none");
   const [trimStart, setTrimStart] = useState("");
   const [trimEnd, setTrimEnd]     = useState("");
   const [linksBat, setLinksBat]   = useState(null);
@@ -748,6 +787,7 @@ export default function App() {
   const [indir, setIndir]                   = useState(DEFAULT_INDIR);
   const [localGroups, setLocalGroups]       = useState([newLocalGroup()]);
   const [localRotation, setLocalRotation]   = useState("none");
+  const [localFlip, setLocalFlip]           = useState("none");
   const [localTrimStart, setLocalTrimStart] = useState("");
   const [localTrimEnd, setLocalTrimEnd]     = useState("");
   const [localBat, setLocalBat]             = useState(null);
@@ -788,7 +828,7 @@ export default function App() {
     : "batch_download_join.bat";
 
   const handleGenerate = () =>
-    setLinksBat(generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd }));
+    setLinksBat(generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, flip, trimStart, trimEnd }));
 
   const linksHint =
     completeCount === 0 ? "Each video needs a name and at least one valid YouTube URL" :
@@ -822,7 +862,7 @@ export default function App() {
     : "batch_join_local.bat";
 
   const handleGenerateLocal = () =>
-    setLocalBat(generateLocalBatch({ groups: localGroups, ffmpeg, indir, outdir, rotation: localRotation, trimStart: localTrimStart, trimEnd: localTrimEnd }));
+    setLocalBat(generateLocalBatch({ groups: localGroups, ffmpeg, indir, outdir, rotation: localRotation, flip: localFlip, trimStart: localTrimStart, trimEnd: localTrimEnd }));
 
   const sameFolder =
     indir.trim() && outdir.trim() &&
@@ -994,6 +1034,7 @@ export default function App() {
 
               <TransformPanel
                 rotation={rotation} setRotation={setRotation}
+                flip={flip} setFlip={setFlip}
                 trimStart={trimStart} setTrimStart={setTrimStart}
                 trimEnd={trimEnd} setTrimEnd={setTrimEnd}
                 onChange={invalidateLinks} multi={multi}
@@ -1071,6 +1112,7 @@ export default function App() {
 
               <TransformPanel
                 rotation={localRotation} setRotation={setLocalRotation}
+                flip={localFlip} setFlip={setLocalFlip}
                 trimStart={localTrimStart} setTrimStart={setLocalTrimStart}
                 trimEnd={localTrimEnd} setTrimEnd={setLocalTrimEnd}
                 onChange={invalidateLocal} multi={localMulti}
@@ -1206,8 +1248,8 @@ export default function App() {
 
         <p style={{ marginTop: 16, fontSize: 11, color: "#475569", textAlign: "center" }}>
           {mode === "local"
-            ? "Requires ffmpeg · Works on files already on your machine · Originals never deleted · Joins use stream copy unless rotating"
-            : "Requires yt-dlp + ffmpeg · One file per video · Joins use stream copy unless rotating"}
+            ? "Requires ffmpeg · Works on files already on your machine · Originals never deleted · Joins use stream copy unless rotating or mirroring"
+            : "Requires yt-dlp + ffmpeg · One file per video · Joins use stream copy unless rotating or mirroring"}
         </p>
 
       </div>
