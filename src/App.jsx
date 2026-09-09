@@ -57,18 +57,50 @@ echo Done. Verifying installs:
 
 pause`;
 
+// Forces yt-dlp and ffmpeg to the latest versions. YouTube changes its
+// player/signature logic often enough that an old yt-dlp build starts
+// failing downloads with things like "HTTP Error 403: Forbidden" — this
+// is the fix for that, distinct from install_ytdlp.bat which only fetches
+// the tools if they're missing.
+const UPDATE_BAT_CONTENT = String.raw`@echo off
+setlocal
+
+set "INSTALL_DIR=C:\ytdlp"
+
+if not exist "%INSTALL_DIR%\yt-dlp.exe" (
+    echo yt-dlp.exe not found in %INSTALL_DIR%.
+    echo Run install_ytdlp.bat first, then come back and run this.
+    pause
+    exit /b 1
+)
+
+echo === Updating yt-dlp ===
+"%INSTALL_DIR%\yt-dlp.exe" -U
+
+echo.
+echo === Updating ffmpeg ===
+curl -L -o "%INSTALL_DIR%\ffmpeg.zip" "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+powershell -NoProfile -Command "Expand-Archive -Path '%INSTALL_DIR%\ffmpeg.zip' -DestinationPath '%INSTALL_DIR%\ffmpeg_temp' -Force"
+for /d %%D in ("%INSTALL_DIR%\ffmpeg_temp\ffmpeg-*") do (
+    copy /y "%%D\bin\ffmpeg.exe" "%INSTALL_DIR%\" >nul
+    copy /y "%%D\bin\ffprobe.exe" "%INSTALL_DIR%\" >nul
+    copy /y "%%D\bin\ffplay.exe" "%INSTALL_DIR%\" >nul
+)
+rmdir /s /q "%INSTALL_DIR%\ffmpeg_temp"
+del "%INSTALL_DIR%\ffmpeg.zip"
+
+echo.
+echo Done. Verifying versions:
+"%INSTALL_DIR%\yt-dlp.exe" --version
+"%INSTALL_DIR%\ffmpeg.exe" -version | findstr /b "ffmpeg"
+
+pause`;
+
 const ROTATIONS = [
   { value: "none",  label: "None"    },
   { value: "cw90",  label: "90° CW"  },
   { value: "ccw90", label: "90° CCW" },
   { value: "180",   label: "180°"    },
-];
-
-const FLIPS = [
-  { value: "none", label: "None"       },
-  { value: "h",    label: "Horizontal" },
-  { value: "v",    label: "Vertical"   },
-  { value: "both", label: "Both"       },
 ];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -97,6 +129,22 @@ function toInputRef(name) {
   const n = name.trim();
   if (/^[a-zA-Z]:[\\/]/.test(n) || /^\\\\/.test(n)) return n;
   return `%INDIR%\\${n}`;
+}
+
+// One yt-dlp download call, immediately followed by a check that the file
+// actually landed. Without this, a failed download (e.g. an outdated
+// yt-dlp hitting an HTTP 403) is silently ignored and the script marches
+// on into ffmpeg with a missing input, eventually printing "Done!" even
+// though nothing usable was produced.
+function dlLineWithCheck(outName, url) {
+  return `%YTDLP% -f "%FMT%" --merge-output-format mp4 -o "${outName}" ${url}
+if not exist "${outName}" (
+    echo.
+    echo ERROR: failed to download "${outName}" - stopping here.
+    echo This is usually an outdated yt-dlp. Try: %YTDLP% -U ^(or run update_ytdlp.bat^)
+    pause
+    exit /b 1
+)`;
 }
 
 function downloadText(filename, content) {
@@ -205,28 +253,15 @@ function buildInitial(videos) {
 
 // ─── Batch generators ────────────────────────────────────────────────────────
 
-// Build the ffmpeg -vf filter chain from rotation + flip selections. Rotation
-// filters come first, then horizontal/vertical mirrors. A non-empty chain means
-// we must re-encode — stream copy can't transform pixels.
-function buildVf(rotation, flip) {
-  const filters = [];
-  if (rotation === "cw90")       filters.push("transpose=1");
-  else if (rotation === "ccw90") filters.push("transpose=2");
-  else if (rotation === "180")   filters.push("vflip", "hflip");
-  if (flip === "h" || flip === "both") filters.push("hflip");
-  if (flip === "v" || flip === "both") filters.push("vflip");
-  return filters;
-}
-
 // One output's worth of batch lines: download parts, then join / rename / process.
-function buildVideoSection({ safe, urls, rotation, flip, trimStart, trimEnd, idx }) {
+function buildVideoSection({ safe, urls, rotation, trimStart, trimEnd, idx }) {
   const single = urls.length === 1;
-  const vfFilters     = buildVf(rotation, flip);
-  const needsReencode = vfFilters.length > 0;
+  const needsReencode = rotation !== "none";
   const hasTrim       = !!(trimStart?.trim() || trimEnd?.trim());
   const hasProcessing = needsReencode || hasTrim;
 
-  const vfArg     = needsReencode ? `-vf "${vfFilters.join(",")}" ` : "";
+  const vfMap = { cw90: "transpose=1", ccw90: "transpose=2", "180": "vflip,hflip" };
+  const vfArg     = needsReencode ? `-vf "${vfMap[rotation]}" ` : "";
   const codecArgs = needsReencode ? "-c:v libx264 -c:a aac" : "-c copy";
 
   let trimArgs = "";
@@ -235,7 +270,7 @@ function buildVideoSection({ safe, urls, rotation, flip, trimStart, trimEnd, idx
 
   const header = `REM ===== Video ${idx}: ${safe} (${single ? "single" : urls.length + " parts"}) =====`;
   const dl = urls
-    .map((url, i) => `%YTDLP% -f "%FMT%" --merge-output-format mp4 -o "${safe} p${i + 1}.mp4" ${url}`)
+    .map((url, i) => dlLineWithCheck(`${safe} p${i + 1}.mp4`, url))
     .join("\n");
 
   let body;
@@ -273,14 +308,14 @@ del ${delParts}`;
 // Local mode — one output's worth of lines for files already on disk.
 // Inputs are the user's originals and are NEVER deleted (only the temp
 // filelist.txt is removed).
-function buildLocalSection({ safe, refs, rotation, flip, trimStart, trimEnd, idx }) {
+function buildLocalSection({ safe, refs, rotation, trimStart, trimEnd, idx }) {
   const single = refs.length === 1;
-  const vfFilters     = buildVf(rotation, flip);
-  const needsReencode = vfFilters.length > 0;
+  const needsReencode = rotation !== "none";
   const hasTrim       = !!(trimStart?.trim() || trimEnd?.trim());
   const hasProcessing = needsReencode || hasTrim;
 
-  const vfArg     = needsReencode ? `-vf "${vfFilters.join(",")}" ` : "";
+  const vfMap = { cw90: "transpose=1", ccw90: "transpose=2", "180": "vflip,hflip" };
+  const vfArg     = needsReencode ? `-vf "${vfMap[rotation]}" ` : "";
   const codecArgs = needsReencode ? "-c:v libx264 -c:a aac" : "-c copy";
 
   let trimArgs = "";
@@ -311,13 +346,13 @@ del filelist.txt`;
 }
 
 // Links mode — one or many videos, each downloaded and joined into its own file.
-function generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, flip, trimStart, trimEnd }) {
+function generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd }) {
   const complete = groups
     .map(g => ({ safe: sanitizeFilename(g.name) || "output", urls: g.urls.filter(u => u.trim()) }))
     .filter(g => g.urls.length > 0);
 
   const blocks = complete
-    .map((g, i) => buildVideoSection({ safe: g.safe, urls: g.urls, rotation, flip, trimStart, trimEnd, idx: i + 1 }))
+    .map((g, i) => buildVideoSection({ safe: g.safe, urls: g.urls, rotation, trimStart, trimEnd, idx: i + 1 }))
     .join("\n\n");
 
   const footer = complete.length === 1
@@ -343,7 +378,7 @@ ${footer}
 }
 
 // Local mode — process files already on the machine (join / rotate / trim).
-function generateLocalBatch({ groups, ffmpeg, indir, outdir, rotation, flip, trimStart, trimEnd }) {
+function generateLocalBatch({ groups, ffmpeg, indir, outdir, rotation, trimStart, trimEnd }) {
   const complete = groups
     .map(g => ({
       safe: sanitizeFilename(g.name) || "output",
@@ -352,7 +387,7 @@ function generateLocalBatch({ groups, ffmpeg, indir, outdir, rotation, flip, tri
     .filter(g => g.refs.length > 0);
 
   const blocks = complete
-    .map((g, i) => buildLocalSection({ safe: g.safe, refs: g.refs, rotation, flip, trimStart, trimEnd, idx: i + 1 }))
+    .map((g, i) => buildLocalSection({ safe: g.safe, refs: g.refs, rotation, trimStart, trimEnd, idx: i + 1 }))
     .join("\n\n");
 
   const footer = complete.length === 1
@@ -409,11 +444,11 @@ function generateJoinBat({ jobs, items, ytdlp, ffmpeg, outdir }) {
     if (single) {
       return `${header}
 echo === Downloading: ${safe} ===
-%YTDLP% -f "%FMT%" --merge-output-format mp4 -o "${safe}.mp4" ${job.items[0].url}`;
+${dlLineWithCheck(`${safe}.mp4`, job.items[0].url)}`;
     }
 
     const dl = job.items
-      .map((it, i) => `%YTDLP% -f "%FMT%" --merge-output-format mp4 -o "${safe} p${i + 1}.mp4" ${it.url}`)
+      .map((it, i) => dlLineWithCheck(`${safe} p${i + 1}.mp4`, it.url))
       .join("\n");
     const fileLines = job.items.map((_, i) => `echo file '${concatEscape(safe)} p${i + 1}.mp4'`).join("\n");
     const delParts  = job.items.map((_, i) => `"${safe} p${i + 1}.mp4"`).join(" ");
@@ -539,16 +574,15 @@ function TimeInput({ label, value, onChange, placeholder }) {
   );
 }
 
-// Rotation + mirror + trim controls, shared by Links and Local modes.
-function TransformPanel({ rotation, setRotation, flip, setFlip, trimStart, setTrimStart, trimEnd, setTrimEnd, onChange, multi }) {
+// Rotation + trim controls, shared by Links and Local modes.
+function TransformPanel({ rotation, setRotation, trimStart, setTrimStart, trimEnd, setTrimEnd, onChange, multi }) {
   const timesValid = isValidTime(trimStart) && isValidTime(trimEnd);
-  const reencodes  = rotation !== "none" || flip !== "none";
   return (
     <div style={{ marginBottom: 16, padding: "14px 16px", background: "#f8fafc", borderRadius: 10, border: "1px solid #e5e7eb" }}>
       <span style={{ ...sectionLabel, marginBottom: multi ? 8 : 14 }}>Transform</span>
       {multi && (
         <p style={{ margin: "0 0 14px", fontSize: 11, color: "#9ca3af", lineHeight: 1.5 }}>
-          With multiple videos, rotation, mirror, and trim are applied to every output. Leave blank for a plain join.
+          With multiple videos, rotation and trim are applied to every output. Leave blank for a plain join.
         </p>
       )}
       <div style={{ marginBottom: 16 }}>
@@ -565,25 +599,8 @@ function TransformPanel({ rotation, setRotation, flip, setFlip, trimStart, setTr
             );
           })}
         </div>
-      </div>
-      <div style={{ marginBottom: 16 }}>
-        <span style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", display: "block", marginBottom: 8 }}>
-          Mirror / Flip <span style={{ fontWeight: 400 }}>— Horizontal fixes a mirrored video</span>
-        </span>
-        <div style={{ display: "flex", gap: 6 }}>
-          {FLIPS.map(opt => {
-            const active = flip === opt.value;
-            return (
-              <button
-                key={opt.value}
-                onClick={() => { setFlip(opt.value); onChange(); }}
-                style={{ flex: 1, whiteSpace: "nowrap", padding: "7px 0", fontSize: 12.5, fontWeight: 600, borderRadius: 7, border: "1.5px solid", borderColor: active ? "#6366f1" : "#d1d5db", background: active ? "#eef2ff" : "#fff", color: active ? "#4338ca" : "#6b7280", cursor: "pointer", transition: "all 0.12s" }}
-              >{opt.label}</button>
-            );
-          })}
-        </div>
-        {reencodes && (
-          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#7c3aed" }}>⚠ Rotation/mirroring re-encodes with libx264 — slower than stream copy</p>
+        {rotation !== "none" && (
+          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#7c3aed" }}>⚠ Re-encodes with libx264 — slower than stream copy</p>
         )}
       </div>
       <div>
@@ -598,8 +615,8 @@ function TransformPanel({ rotation, setRotation, flip, setFlip, trimStart, setTr
         {(trimStart || trimEnd) && !timesValid && (
           <p style={{ margin: "7px 0 0", fontSize: 11, color: "#f87171" }}>Use M:SS or H:MM:SS (e.g. 1:30 or 0:01:30)</p>
         )}
-        {(trimStart || trimEnd) && timesValid && !reencodes && (
-          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#6b7280" }}>Trim without rotation or mirroring uses stream copy — cuts at nearest keyframe</p>
+        {(trimStart || trimEnd) && timesValid && rotation === "none" && (
+          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#6b7280" }}>Trim without rotation uses stream copy — cuts at nearest keyframe</p>
         )}
       </div>
     </div>
@@ -778,7 +795,6 @@ export default function App() {
   // Links mode — a list of videos, each with its own name + parts
   const [groups, setGroups]       = useState([newGroup()]);
   const [rotation, setRotation]   = useState("none");
-  const [flip, setFlip]           = useState("none");
   const [trimStart, setTrimStart] = useState("");
   const [trimEnd, setTrimEnd]     = useState("");
   const [linksBat, setLinksBat]   = useState(null);
@@ -787,7 +803,6 @@ export default function App() {
   const [indir, setIndir]                   = useState(DEFAULT_INDIR);
   const [localGroups, setLocalGroups]       = useState([newLocalGroup()]);
   const [localRotation, setLocalRotation]   = useState("none");
-  const [localFlip, setLocalFlip]           = useState("none");
   const [localTrimStart, setLocalTrimStart] = useState("");
   const [localTrimEnd, setLocalTrimEnd]     = useState("");
   const [localBat, setLocalBat]             = useState(null);
@@ -828,7 +843,7 @@ export default function App() {
     : "batch_download_join.bat";
 
   const handleGenerate = () =>
-    setLinksBat(generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, flip, trimStart, trimEnd }));
+    setLinksBat(generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd }));
 
   const linksHint =
     completeCount === 0 ? "Each video needs a name and at least one valid YouTube URL" :
@@ -862,7 +877,7 @@ export default function App() {
     : "batch_join_local.bat";
 
   const handleGenerateLocal = () =>
-    setLocalBat(generateLocalBatch({ groups: localGroups, ffmpeg, indir, outdir, rotation: localRotation, flip: localFlip, trimStart: localTrimStart, trimEnd: localTrimEnd }));
+    setLocalBat(generateLocalBatch({ groups: localGroups, ffmpeg, indir, outdir, rotation: localRotation, trimStart: localTrimStart, trimEnd: localTrimEnd }));
 
   const sameFolder =
     indir.trim() && outdir.trim() &&
@@ -1001,6 +1016,27 @@ export default function App() {
           >⬇ install_ytdlp.bat</button>
         </div>
 
+        {/* Update banner — YouTube changes often enough that an old yt-dlp
+            build starts failing downloads (commonly "HTTP Error 403: Forbidden"),
+            so this is separate from the one-time install above. */}
+        <div style={{ marginBottom: 16, padding: "14px 16px", background: "rgba(148, 163, 184, 0.06)", border: "1px solid rgba(148, 163, 184, 0.2)", borderRadius: 12, display: "flex", alignItems: "center", gap: 14 }}>
+          <div style={{ fontSize: 22, flexShrink: 0 }}>🔄</div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", display: "block", marginBottom: 3 }}>
+              Downloads suddenly failing (403 errors)?
+            </span>
+            <span style={{ fontSize: 11.5, color: "#64748b", lineHeight: 1.5 }}>
+              YouTube changes often enough that an old yt-dlp build breaks. Download and run{" "}
+              <code style={{ color: "#94a3b8", background: "rgba(148,163,184,0.15)", padding: "1px 5px", borderRadius: 4, fontSize: 11 }}>update_ytdlp.bat</code>
+              {" "}to update yt-dlp and ffmpeg to their latest versions.
+            </span>
+          </div>
+          <button
+            onClick={() => downloadText("update_ytdlp.bat", UPDATE_BAT_CONTENT)}
+            style={{ padding: "8px 13px", fontSize: 12, fontWeight: 700, flexShrink: 0, borderRadius: 8, border: "1px solid rgba(148, 163, 184, 0.35)", background: "rgba(148, 163, 184, 0.12)", color: "#cbd5e1", cursor: "pointer", whiteSpace: "nowrap" }}
+          >⬇ update_ytdlp.bat</button>
+        </div>
+
         {/* ─── LINKS MODE ─── */}
         {mode === "links" && (
           <>
@@ -1034,7 +1070,6 @@ export default function App() {
 
               <TransformPanel
                 rotation={rotation} setRotation={setRotation}
-                flip={flip} setFlip={setFlip}
                 trimStart={trimStart} setTrimStart={setTrimStart}
                 trimEnd={trimEnd} setTrimEnd={setTrimEnd}
                 onChange={invalidateLinks} multi={multi}
@@ -1112,7 +1147,6 @@ export default function App() {
 
               <TransformPanel
                 rotation={localRotation} setRotation={setLocalRotation}
-                flip={localFlip} setFlip={setLocalFlip}
                 trimStart={localTrimStart} setTrimStart={setLocalTrimStart}
                 trimEnd={localTrimEnd} setTrimEnd={setLocalTrimEnd}
                 onChange={invalidateLocal} multi={localMulti}
@@ -1248,8 +1282,8 @@ export default function App() {
 
         <p style={{ marginTop: 16, fontSize: 11, color: "#475569", textAlign: "center" }}>
           {mode === "local"
-            ? "Requires ffmpeg · Works on files already on your machine · Originals never deleted · Joins use stream copy unless rotating or mirroring"
-            : "Requires yt-dlp + ffmpeg · One file per video · Joins use stream copy unless rotating or mirroring"}
+            ? "Requires ffmpeg · Works on files already on your machine · Originals never deleted · Joins use stream copy unless rotating"
+            : "Requires yt-dlp + ffmpeg · One file per video · Joins use stream copy unless rotating"}
         </p>
 
       </div>
