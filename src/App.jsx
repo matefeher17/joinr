@@ -448,7 +448,7 @@ set OUTDIR=${outdir}
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 cd /d "%OUTDIR%"
 
-set FMT=bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b
+set "FMT=bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
 
 ${blocks}
 
@@ -560,7 +560,7 @@ set OUTDIR=${outdir}
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 cd /d "%OUTDIR%"
 
-set FMT=bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b
+set "FMT=bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
 
 ${blocks}
 
@@ -743,7 +743,7 @@ OUTDIR=${shPath(outdir)}
 mkdir -p "$OUTDIR"
 cd "$OUTDIR" || exit 1
 
-FMT='bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
+FMT='bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
 
 ${SH_ADD_FILE}
 
@@ -850,7 +850,7 @@ OUTDIR=${shPath(outdir)}
 mkdir -p "$OUTDIR"
 cd "$OUTDIR" || exit 1
 
-FMT='bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
+FMT='bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
 
 ${SH_ADD_FILE}
 
