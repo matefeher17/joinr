@@ -165,6 +165,20 @@ const ROTATIONS = [
 // Rebuilding the streams gives clean timestamps, so joined parts don't freeze.
 const ENCODE_ARGS = "-c:v libx264 -preset veryfast -crf 18 -c:a aac -b:a 192k";
 
+// Re-encoding join of several files. Uses ffmpeg's concat FILTER (not the concat
+// demuxer) and resets each input's timestamps to zero first. The demuxer trusts
+// each part's own timestamps, and when they are odd (video starting late, video
+// shorter than audio, ...) ffmpeg drops frames -> frozen picture over running audio.
+// "refs" are already quoted for the target shell.
+function concatFilterCmd({ ff, refs, trimArgs, vf, out }) {
+  const n = refs.length;
+  const prep = refs.map((_, i) => `[${i}:v]setpts=PTS-STARTPTS[v${i}];[${i}:a]asetpts=PTS-STARTPTS[a${i}];`).join("");
+  const pads = refs.map((_, i) => `[v${i}][a${i}]`).join("");
+  const tail = vf ? `concat=n=${n}:v=1:a=1[vc][a];[vc]${vf}[v]` : `concat=n=${n}:v=1:a=1[v][a]`;
+  const inputs = refs.map(r => `-i ${r}`).join(" ");
+  return `${ff} ${inputs} -filter_complex "${prep}${pads}${tail}" -map "[v]" -map "[a]" -fps_mode vfr ${trimArgs}${ENCODE_ARGS} ${out}`;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function isYouTubeUrl(url) {
@@ -364,16 +378,18 @@ del "${safe} p1.mp4"`;
     const joinLabel = reencoding
       ? `Joining and re-encoding (may take several minutes)`
       : hasProcessing ? "Joining and processing" : "Joining";
+    const joinCmd = reencoding
+      ? concatFilterCmd({ ff: "%FFMPEG%", refs: urls.map((_, i) => `"${safe} p${i + 1}.mp4"`), trimArgs, vf: needsReencode ? vfMap[rotation] : "", out: `"${safe}.mp4"` })
+      : `%FFMPEG% -f concat -safe 0 -i filelist.txt ${trimArgs}${vfArg}${codecArgs} "${safe}.mp4"`;
     body =
 `echo === Downloading ${urls.length} parts: ${safe} ===
 ${dl}
 echo === ${joinLabel}: ${safe} ===
-(
+${reencoding ? "" : `(
 ${fileLines}
 ) > filelist.txt
-%FFMPEG% -f concat -safe 0 -i filelist.txt ${trimArgs}${vfArg}${codecArgs} "${safe}.mp4"
-del filelist.txt
-del ${delParts}`;
+`}${joinCmd}
+${reencoding ? "" : "del filelist.txt\n"}del ${delParts}`;
   }
 
   return `${header}\n${body}`;
@@ -414,6 +430,11 @@ echo === Processing${reencoding ? " (re-encoding, may take a few minutes)" : ""}
   const joinLabel = reencoding
     ? `Joining and re-encoding (may take several minutes)`
     : hasProcessing ? "Joining and processing" : "Joining";
+  if (reencoding) {
+    return `${header}
+echo === ${joinLabel} ${refs.length} files: ${safe} ===
+${concatFilterCmd({ ff: "%FFMPEG%", refs: refs.map(r => `"${r}"`), trimArgs, vf: needsReencode ? vfMap[rotation] : "", out: `"${safe}.mp4"` })}`;
+  }
   return `${header}
 echo === ${joinLabel} ${refs.length} files: ${safe} ===
 (
@@ -518,8 +539,6 @@ function generateJoinBat({ jobs, items, ytdlp, ffmpeg, outdir, accurate, platfor
     .map(j => ({ name: j.name, items: items.filter(it => it.jobId === j.id) }))
     .filter(j => j.items.length > 0);
 
-  const joinCodec = accurate ? ENCODE_ARGS : "-c copy";
-
   const blocks = active.map((job, ji) => {
     const safe = sanitizeFilename(job.name) || `output_${ji + 1}`;
     const single = job.items.length === 1;
@@ -537,16 +556,19 @@ ${dlLineWithCheck(`${safe}.mp4`, job.items[0].url)}`;
     const fileLines = job.items.map((_, i) => `echo file '${concatEscape(safe)} p${i + 1}.mp4'`).join("\n");
     const delParts  = job.items.map((_, i) => `"${safe} p${i + 1}.mp4"`).join(" ");
     const joinLabel = accurate ? "Joining and re-encoding (may take several minutes)" : "Joining";
+    const joinCmd = accurate
+      ? `${concatFilterCmd({ ff: "%FFMPEG%", refs: job.items.map((_, i) => `"${safe} p${i + 1}.mp4"`), trimArgs: "", vf: "", out: `"${safe}.mp4"` })}`
+      : `(
+${fileLines}
+) > filelist.txt
+%FFMPEG% -f concat -safe 0 -i filelist.txt -c copy "${safe}.mp4"
+del filelist.txt`;
 
     return `${header}
 echo === Downloading ${job.items.length} parts: ${safe} ===
 ${dl}
 echo === ${joinLabel}: ${safe} ===
-(
-${fileLines}
-) > filelist.txt
-%FFMPEG% -f concat -safe 0 -i filelist.txt ${joinCodec} "${safe}.mp4"
-del filelist.txt
+${joinCmd}
 del ${delParts}`;
   }).join("\n\n");
 
@@ -668,14 +690,17 @@ rm -f ${part(0)}`;
     const joinLabel = reencoding
       ? "Joining and re-encoding (may take several minutes)"
       : hasProcessing ? "Joining and processing" : "Joining";
+    const joinCmd = reencoding
+      ? concatFilterCmd({ ff: '"$FFMPEG"', refs: urls.map((_, i) => part(i)), trimArgs, vf: needsReencode ? vfMap[rotation] : "", out })
+      : `: > filelist.txt
+${addLines}
+"$FFMPEG" -f concat -safe 0 -i filelist.txt ${trimArgs}${vfArg}${codecArgs} ${out}
+rm -f filelist.txt`;
     body =
 `${shSay(`=== Downloading ${urls.length} parts: ${safe} ===`)}
 ${dl}
 ${shSay(`=== ${joinLabel}: ${safe} ===`)}
-: > filelist.txt
-${addLines}
-"$FFMPEG" -f concat -safe 0 -i filelist.txt ${trimArgs}${vfArg}${codecArgs} ${out}
-rm -f filelist.txt
+${joinCmd}
 rm -f ${delParts}`;
   }
 
@@ -714,6 +739,11 @@ ${shSay(`=== Processing${reencoding ? " (re-encoding, may take a few minutes)" :
   const joinLabel = reencoding
     ? "Joining and re-encoding (may take several minutes)"
     : hasProcessing ? "Joining and processing" : "Joining";
+  if (reencoding) {
+    return `${header}
+${shSay(`=== ${joinLabel} ${refs.length} files: ${safe} ===`)}
+${concatFilterCmd({ ff: '"$FFMPEG"', refs, trimArgs, vf: needsReencode ? vfMap[rotation] : "", out })}`;
+  }
   return `${header}
 ${shSay(`=== ${joinLabel} ${refs.length} files: ${safe} ===`)}
 : > filelist.txt
@@ -812,8 +842,6 @@ function generateJoinSh({ jobs, items, ytdlp, ffmpeg, outdir, accurate }) {
     .map(j => ({ name: j.name, items: items.filter(it => it.jobId === j.id) }))
     .filter(j => j.items.length > 0);
 
-  const joinCodec = accurate ? ENCODE_ARGS : "-c copy";
-
   const blocks = active.map((job, ji) => {
     const safe = sanitizeFilename(job.name) || `output_${ji + 1}`;
     const single = job.items.length === 1;
@@ -831,14 +859,17 @@ ${dlLineWithCheckSh(`${safe}.mp4`, job.items[0].url)}`;
     const delParts = job.items.map((_, i) => part(i)).join(" ");
     const joinLabel = accurate ? "Joining and re-encoding (may take several minutes)" : "Joining";
 
+    const joinCmd = accurate
+      ? concatFilterCmd({ ff: '"$FFMPEG"', refs: job.items.map((_, i) => part(i)), trimArgs: "", vf: "", out: shq(`${safe}.mp4`) })
+      : `: > filelist.txt
+${addLines}
+"$FFMPEG" -f concat -safe 0 -i filelist.txt -c copy ${shq(`${safe}.mp4`)}
+rm -f filelist.txt`;
     return `${header}
 ${shSay(`=== Downloading ${job.items.length} parts: ${safe} ===`)}
 ${dl}
 ${shSay(`=== ${joinLabel}: ${safe} ===`)}
-: > filelist.txt
-${addLines}
-"$FFMPEG" -f concat -safe 0 -i filelist.txt ${joinCodec} ${shq(`${safe}.mp4`)}
-rm -f filelist.txt
+${joinCmd}
 rm -f ${delParts}`;
   }).join("\n\n");
 
