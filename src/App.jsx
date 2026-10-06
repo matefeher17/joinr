@@ -1,9 +1,17 @@
 import { useState } from "react";
 
-const DEFAULT_YTDLP = "C:\\ytdlp\\yt-dlp.exe";
-const DEFAULT_FFMPEG = "C:\\ytdlp\\ffmpeg.exe";
-const DEFAULT_OUTDIR = "C:\\ytdlp\\Output";
-const DEFAULT_INDIR = "C:\\Videos";
+// Per-platform defaults. On a Mac, yt-dlp and ffmpeg normally come from
+// Homebrew and are on the PATH, so the "path" is just the command name.
+const DEFAULTS = {
+  windows: { ytdlp: "C:\\ytdlp\\yt-dlp.exe", ffmpeg: "C:\\ytdlp\\ffmpeg.exe", outdir: "C:\\ytdlp\\Output", indir: "C:\\Videos" },
+  mac:     { ytdlp: "yt-dlp",                ffmpeg: "ffmpeg",                outdir: "~/Movies/Joinr",     indir: "~/Movies" },
+};
+const SCRIPT_EXT = { windows: ".bat", mac: ".command" };
+
+function detectPlatform() {
+  const nav = typeof navigator !== "undefined" ? navigator : {};
+  return /mac/i.test(nav.platform || nav.userAgent || "") ? "mac" : "windows";
+}
 
 const INSTALL_BAT_CONTENT = String.raw`@echo off
 setlocal enabledelayedexpansion
@@ -96,12 +104,66 @@ echo Done. Verifying versions:
 
 pause`;
 
+// Mac equivalents of the two helper scripts above. Homebrew is the supported
+// way to get yt-dlp + ffmpeg on a Mac, so install and update both use it.
+const INSTALL_SH_CONTENT = String.raw`#!/bin/bash
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+if ! command -v brew >/dev/null 2>&1; then
+  echo "Homebrew is not installed."
+  echo "Install it from https://brew.sh, then run this script again."
+  read -r -p "Press Enter to close..." _
+  exit 1
+fi
+
+echo "=== Installing yt-dlp and ffmpeg ==="
+brew install yt-dlp ffmpeg
+
+echo
+echo "Done. Verifying installs:"
+yt-dlp --version
+ffmpeg -version | head -n 1
+
+read -r -p "Press Enter to close..." _
+`;
+
+const UPDATE_SH_CONTENT = String.raw`#!/bin/bash
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+if ! command -v yt-dlp >/dev/null 2>&1; then
+  echo "yt-dlp not found. Run install_ytdlp.command first, then come back and run this."
+  read -r -p "Press Enter to close..." _
+  exit 1
+fi
+
+if command -v brew >/dev/null 2>&1; then
+  echo "=== Updating Homebrew and upgrading yt-dlp + ffmpeg ==="
+  brew update
+  brew upgrade yt-dlp ffmpeg
+else
+  echo "=== Updating yt-dlp ==="
+  yt-dlp -U
+  echo "Homebrew not found - update ffmpeg yourself if you installed it another way."
+fi
+
+echo
+echo "Done. Verifying versions:"
+yt-dlp --version
+ffmpeg -version | head -n 1
+
+read -r -p "Press Enter to close..." _
+`;
+
 const ROTATIONS = [
   { value: "none",  label: "None"    },
   { value: "cw90",  label: "90° CW"  },
   { value: "ccw90", label: "90° CCW" },
   { value: "180",   label: "180°"    },
 ];
+
+// Re-encode settings used for rotation and for "Accurate join" mode.
+// Rebuilding the streams gives clean timestamps, so joined parts don't freeze.
+const ENCODE_ARGS = "-c:v libx264 -preset veryfast -crf 18 -c:a aac -b:a 192k";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -153,6 +215,14 @@ function downloadText(filename, content) {
   a.href = URL.createObjectURL(blob);
   a.download = filename;
   a.click();
+}
+
+// Decide how ffmpeg should write the output.
+// Rotation always re-encodes. In accurate mode, joins and trims re-encode too.
+function buildCodecArgs({ rotation, hasTrim, joining, accurate }) {
+  const needsReencode = rotation !== "none";
+  const reencode = needsReencode || (accurate && (hasTrim || joining));
+  return reencode ? ENCODE_ARGS : "-c copy";
 }
 
 // Try to pull a "part" marker out of a title.
@@ -254,7 +324,7 @@ function buildInitial(videos) {
 // ─── Batch generators ────────────────────────────────────────────────────────
 
 // One output's worth of batch lines: download parts, then join / rename / process.
-function buildVideoSection({ safe, urls, rotation, trimStart, trimEnd, idx }) {
+function buildVideoSection({ safe, urls, rotation, trimStart, trimEnd, idx, accurate }) {
   const single = urls.length === 1;
   const needsReencode = rotation !== "none";
   const hasTrim       = !!(trimStart?.trim() || trimEnd?.trim());
@@ -262,7 +332,8 @@ function buildVideoSection({ safe, urls, rotation, trimStart, trimEnd, idx }) {
 
   const vfMap = { cw90: "transpose=1", ccw90: "transpose=2", "180": "vflip,hflip" };
   const vfArg     = needsReencode ? `-vf "${vfMap[rotation]}" ` : "";
-  const codecArgs = needsReencode ? "-c:v libx264 -c:a aac" : "-c copy";
+  const codecArgs = buildCodecArgs({ rotation, hasTrim, joining: !single, accurate });
+  const reencoding = codecArgs !== "-c copy";
 
   let trimArgs = "";
   if (trimStart?.trim()) trimArgs += `-ss ${trimStart.trim()} `;
@@ -284,16 +355,19 @@ ren "${safe} p1.mp4" "${safe}.mp4"`;
     body =
 `echo === Downloading: ${safe} ===
 ${dl}
-echo === Processing: ${safe} ===
+echo === Processing${reencoding ? " (re-encoding, may take a few minutes)" : ""}: ${safe} ===
 %FFMPEG% -i "${safe} p1.mp4" ${trimArgs}${vfArg}${codecArgs} "${safe}.mp4"
 del "${safe} p1.mp4"`;
   } else {
     const fileLines = urls.map((_, i) => `echo file '${concatEscape(safe)} p${i + 1}.mp4'`).join("\n");
     const delParts  = urls.map((_, i) => `"${safe} p${i + 1}.mp4"`).join(" ");
+    const joinLabel = reencoding
+      ? `Joining and re-encoding (may take several minutes)`
+      : hasProcessing ? "Joining and processing" : "Joining";
     body =
 `echo === Downloading ${urls.length} parts: ${safe} ===
 ${dl}
-echo === Joining${hasProcessing ? " and processing" : ""}: ${safe} ===
+echo === ${joinLabel}: ${safe} ===
 (
 ${fileLines}
 ) > filelist.txt
@@ -308,7 +382,7 @@ del ${delParts}`;
 // Local mode — one output's worth of lines for files already on disk.
 // Inputs are the user's originals and are NEVER deleted (only the temp
 // filelist.txt is removed).
-function buildLocalSection({ safe, refs, rotation, trimStart, trimEnd, idx }) {
+function buildLocalSection({ safe, refs, rotation, trimStart, trimEnd, idx, accurate }) {
   const single = refs.length === 1;
   const needsReencode = rotation !== "none";
   const hasTrim       = !!(trimStart?.trim() || trimEnd?.trim());
@@ -316,7 +390,8 @@ function buildLocalSection({ safe, refs, rotation, trimStart, trimEnd, idx }) {
 
   const vfMap = { cw90: "transpose=1", ccw90: "transpose=2", "180": "vflip,hflip" };
   const vfArg     = needsReencode ? `-vf "${vfMap[rotation]}" ` : "";
-  const codecArgs = needsReencode ? "-c:v libx264 -c:a aac" : "-c copy";
+  const codecArgs = buildCodecArgs({ rotation, hasTrim, joining: !single, accurate });
+  const reencoding = codecArgs !== "-c copy";
 
   let trimArgs = "";
   if (trimStart?.trim()) trimArgs += `-ss ${trimStart.trim()} `;
@@ -332,12 +407,15 @@ copy "${refs[0]}" "${safe}.mp4"`;
   }
   if (single) {
     return `${header}
-echo === Processing: ${safe} ===
+echo === Processing${reencoding ? " (re-encoding, may take a few minutes)" : ""}: ${safe} ===
 %FFMPEG% -i "${refs[0]}" ${trimArgs}${vfArg}${codecArgs} "${safe}.mp4"`;
   }
   const fileLines = refs.map(r => `echo file '${concatEscape(r)}'`).join("\n");
+  const joinLabel = reencoding
+    ? `Joining and re-encoding (may take several minutes)`
+    : hasProcessing ? "Joining and processing" : "Joining";
   return `${header}
-echo === Joining${hasProcessing ? " and processing" : ""} ${refs.length} files: ${safe} ===
+echo === ${joinLabel} ${refs.length} files: ${safe} ===
 (
 ${fileLines}
 ) > filelist.txt
@@ -346,13 +424,14 @@ del filelist.txt`;
 }
 
 // Links mode — one or many videos, each downloaded and joined into its own file.
-function generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd }) {
+function generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd, accurate, platform }) {
+  if (platform === "mac") return generateLinksSh({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd, accurate });
   const complete = groups
     .map(g => ({ safe: sanitizeFilename(g.name) || "output", urls: g.urls.filter(u => u.trim()) }))
     .filter(g => g.urls.length > 0);
 
   const blocks = complete
-    .map((g, i) => buildVideoSection({ safe: g.safe, urls: g.urls, rotation, trimStart, trimEnd, idx: i + 1 }))
+    .map((g, i) => buildVideoSection({ safe: g.safe, urls: g.urls, rotation, trimStart, trimEnd, idx: i + 1, accurate }))
     .join("\n\n");
 
   const footer = complete.length === 1
@@ -378,7 +457,8 @@ ${footer}
 }
 
 // Local mode — process files already on the machine (join / rotate / trim).
-function generateLocalBatch({ groups, ffmpeg, indir, outdir, rotation, trimStart, trimEnd }) {
+function generateLocalBatch({ groups, ffmpeg, indir, outdir, rotation, trimStart, trimEnd, accurate, platform }) {
+  if (platform === "mac") return generateLocalSh({ groups, ffmpeg, indir, outdir, rotation, trimStart, trimEnd, accurate });
   const complete = groups
     .map(g => ({
       safe: sanitizeFilename(g.name) || "output",
@@ -387,7 +467,7 @@ function generateLocalBatch({ groups, ffmpeg, indir, outdir, rotation, trimStart
     .filter(g => g.refs.length > 0);
 
   const blocks = complete
-    .map((g, i) => buildLocalSection({ safe: g.safe, refs: g.refs, rotation, trimStart, trimEnd, idx: i + 1 }))
+    .map((g, i) => buildLocalSection({ safe: g.safe, refs: g.refs, rotation, trimStart, trimEnd, idx: i + 1, accurate }))
     .join("\n\n");
 
   const footer = complete.length === 1
@@ -413,7 +493,8 @@ ${footer}
 }
 
 // Playlist step 1 — list the playlist's videos into playlist.txt
-function generateDumpBat({ playlistUrl, ytdlp }) {
+function generateDumpBat({ playlistUrl, ytdlp, platform }) {
+  if (platform === "mac") return generateDumpSh({ playlistUrl, ytdlp });
   return `@echo off
 setlocal
 
@@ -430,11 +511,14 @@ pause
 }
 
 // Playlist step 2 — one script, every job downloaded and joined in turn.
-function generateJoinBat({ jobs, items, ytdlp, ffmpeg, outdir }) {
+function generateJoinBat({ jobs, items, ytdlp, ffmpeg, outdir, accurate, platform }) {
+  if (platform === "mac") return generateJoinSh({ jobs, items, ytdlp, ffmpeg, outdir, accurate });
   const active = jobs
     .filter(j => !j.excluded)
     .map(j => ({ name: j.name, items: items.filter(it => it.jobId === j.id) }))
     .filter(j => j.items.length > 0);
+
+  const joinCodec = accurate ? ENCODE_ARGS : "-c copy";
 
   const blocks = active.map((job, ji) => {
     const safe = sanitizeFilename(job.name) || `output_${ji + 1}`;
@@ -452,15 +536,16 @@ ${dlLineWithCheck(`${safe}.mp4`, job.items[0].url)}`;
       .join("\n");
     const fileLines = job.items.map((_, i) => `echo file '${concatEscape(safe)} p${i + 1}.mp4'`).join("\n");
     const delParts  = job.items.map((_, i) => `"${safe} p${i + 1}.mp4"`).join(" ");
+    const joinLabel = accurate ? "Joining and re-encoding (may take several minutes)" : "Joining";
 
     return `${header}
 echo === Downloading ${job.items.length} parts: ${safe} ===
 ${dl}
-echo === Joining: ${safe} ===
+echo === ${joinLabel}: ${safe} ===
 (
 ${fileLines}
 ) > filelist.txt
-%FFMPEG% -f concat -safe 0 -i filelist.txt -c copy "${safe}.mp4"
+%FFMPEG% -f concat -safe 0 -i filelist.txt ${joinCodec} "${safe}.mp4"
 del filelist.txt
 del ${delParts}`;
   }).join("\n\n");
@@ -485,6 +570,298 @@ pause
 `;
 }
 
+// ─── Mac shell-script generators ─────────────────────────────────────────────
+// Same jobs as the .bat generators above, written as bash for macOS.
+
+// Double-quote a literal string for bash (escapes \ " $ and backtick).
+function shq(s) {
+  return '"' + s.replace(/[\\"$`]/g, "\\$&") + '"';
+}
+
+// Single-quote a string for bash (used for URLs, which contain & and ?).
+function shsq(s) {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+// A path typed into the UI. A leading ~ means the home folder; $HOME and the
+// like are left alone so they expand when the script runs.
+function shPath(p) {
+  const t = p.trim();
+  const tilde = t.startsWith("~");
+  const body = (tilde ? t.slice(1) : t).replace(/[\\"`]/g, "\\$&");
+  return '"' + (tilde ? "$HOME" : "") + body + '"';
+}
+
+// A local source file as a ready-to-use bash word. Bare names live in $INDIR;
+// anything starting with / or ~ is used as typed.
+function toInputRefSh(name) {
+  const n = name.trim();
+  if (n.startsWith("/") || n.startsWith("~")) return shPath(n);
+  return '"$INDIR/' + n.replace(/[\\"$`]/g, "\\$&") + '"';
+}
+
+const SH_PRELUDE = `#!/bin/bash
+# Homebrew lives in different places on Apple Silicon and Intel Macs.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+`;
+
+const SH_PAUSE = `read -r -p "Press Enter to close..." _`;
+
+// Appends one line to ffmpeg's concat list, escaping any apostrophes.
+const SH_ADD_FILE = String.raw`add_file() {
+  esc=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+  printf "file '%s'\n" "$esc" >> filelist.txt
+}`;
+
+const shSay = (text) => `echo ${shq(text)}`;
+
+// yt-dlp download + a check that the file actually landed (mirrors dlLineWithCheck).
+function dlLineWithCheckSh(outName, url) {
+  const n = shq(outName);
+  return `"$YTDLP" -f "$FMT" --merge-output-format mp4 -o ${n} ${shsq(url)}
+if [ ! -f ${n} ]; then
+  echo
+  ${shSay(`ERROR: failed to download "${outName}" - stopping here.`)}
+  echo "This is usually an outdated yt-dlp. Try: brew upgrade yt-dlp (or run update_ytdlp.command)"
+  ${SH_PAUSE}
+  exit 1
+fi`;
+}
+
+function buildVideoSectionSh({ safe, urls, rotation, trimStart, trimEnd, idx, accurate }) {
+  const single = urls.length === 1;
+  const needsReencode = rotation !== "none";
+  const hasTrim       = !!(trimStart?.trim() || trimEnd?.trim());
+  const hasProcessing = needsReencode || hasTrim;
+
+  const vfMap = { cw90: "transpose=1", ccw90: "transpose=2", "180": "vflip,hflip" };
+  const vfArg     = needsReencode ? `-vf "${vfMap[rotation]}" ` : "";
+  const codecArgs = buildCodecArgs({ rotation, hasTrim, joining: !single, accurate });
+  const reencoding = codecArgs !== "-c copy";
+
+  let trimArgs = "";
+  if (trimStart?.trim()) trimArgs += `-ss ${trimStart.trim()} `;
+  if (trimEnd?.trim())   trimArgs += `-to ${trimEnd.trim()} `;
+
+  const part = (i) => shq(`${safe} p${i + 1}.mp4`);
+  const out  = shq(`${safe}.mp4`);
+  const header = `# ===== Video ${idx}: ${safe} (${single ? "single" : urls.length + " parts"}) =====`;
+  const dl = urls.map((url, i) => dlLineWithCheckSh(`${safe} p${i + 1}.mp4`, url)).join("\n");
+
+  let body;
+  if (single && !hasProcessing) {
+    body =
+`${shSay(`=== Downloading: ${safe} ===`)}
+${dl}
+echo "=== Renaming ==="
+mv ${part(0)} ${out}`;
+  } else if (single) {
+    body =
+`${shSay(`=== Downloading: ${safe} ===`)}
+${dl}
+${shSay(`=== Processing${reencoding ? " (re-encoding, may take a few minutes)" : ""}: ${safe} ===`)}
+"$FFMPEG" -i ${part(0)} ${trimArgs}${vfArg}${codecArgs} ${out}
+rm -f ${part(0)}`;
+  } else {
+    const addLines = urls.map((_, i) => `add_file ${part(i)}`).join("\n");
+    const delParts = urls.map((_, i) => part(i)).join(" ");
+    const joinLabel = reencoding
+      ? "Joining and re-encoding (may take several minutes)"
+      : hasProcessing ? "Joining and processing" : "Joining";
+    body =
+`${shSay(`=== Downloading ${urls.length} parts: ${safe} ===`)}
+${dl}
+${shSay(`=== ${joinLabel}: ${safe} ===`)}
+: > filelist.txt
+${addLines}
+"$FFMPEG" -f concat -safe 0 -i filelist.txt ${trimArgs}${vfArg}${codecArgs} ${out}
+rm -f filelist.txt
+rm -f ${delParts}`;
+  }
+
+  return `${header}\n${body}`;
+}
+
+function buildLocalSectionSh({ safe, refs, rotation, trimStart, trimEnd, idx, accurate }) {
+  const single = refs.length === 1;
+  const needsReencode = rotation !== "none";
+  const hasTrim       = !!(trimStart?.trim() || trimEnd?.trim());
+  const hasProcessing = needsReencode || hasTrim;
+
+  const vfMap = { cw90: "transpose=1", ccw90: "transpose=2", "180": "vflip,hflip" };
+  const vfArg     = needsReencode ? `-vf "${vfMap[rotation]}" ` : "";
+  const codecArgs = buildCodecArgs({ rotation, hasTrim, joining: !single, accurate });
+  const reencoding = codecArgs !== "-c copy";
+
+  let trimArgs = "";
+  if (trimStart?.trim()) trimArgs += `-ss ${trimStart.trim()} `;
+  if (trimEnd?.trim())   trimArgs += `-to ${trimEnd.trim()} `;
+
+  const out = shq(`${safe}.mp4`);
+  const header = `# ===== Output ${idx}: ${safe} (${single ? "1 file" : refs.length + " files joined"}) =====`;
+
+  if (single && !hasProcessing) {
+    return `${header}
+${shSay(`=== Copying: ${safe} ===`)}
+cp ${refs[0]} ${out}`;
+  }
+  if (single) {
+    return `${header}
+${shSay(`=== Processing${reencoding ? " (re-encoding, may take a few minutes)" : ""}: ${safe} ===`)}
+"$FFMPEG" -i ${refs[0]} ${trimArgs}${vfArg}${codecArgs} ${out}`;
+  }
+  const addLines = refs.map(r => `add_file ${r}`).join("\n");
+  const joinLabel = reencoding
+    ? "Joining and re-encoding (may take several minutes)"
+    : hasProcessing ? "Joining and processing" : "Joining";
+  return `${header}
+${shSay(`=== ${joinLabel} ${refs.length} files: ${safe} ===`)}
+: > filelist.txt
+${addLines}
+"$FFMPEG" -f concat -safe 0 -i filelist.txt ${trimArgs}${vfArg}${codecArgs} ${out}
+rm -f filelist.txt`;
+}
+
+function generateLinksSh({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd, accurate }) {
+  const complete = groups
+    .map(g => ({ safe: sanitizeFilename(g.name) || "output", urls: g.urls.filter(u => u.trim()) }))
+    .filter(g => g.urls.length > 0);
+
+  const blocks = complete
+    .map((g, i) => buildVideoSectionSh({ safe: g.safe, urls: g.urls, rotation, trimStart, trimEnd, idx: i + 1, accurate }))
+    .join("\n\n");
+
+  const footer = complete.length === 1
+    ? `echo\n${shSay(`Done! Output: ${complete[0].safe}.mp4`)}`
+    : `echo\necho "All done! ${complete.length} file(s) created in $OUTDIR"`;
+
+  return `${SH_PRELUDE}
+YTDLP=${shPath(ytdlp)}
+FFMPEG=${shPath(ffmpeg)}
+OUTDIR=${shPath(outdir)}
+
+mkdir -p "$OUTDIR"
+cd "$OUTDIR" || exit 1
+
+FMT='bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
+
+${SH_ADD_FILE}
+
+${blocks}
+
+${footer}
+${SH_PAUSE}
+`;
+}
+
+function generateLocalSh({ groups, ffmpeg, indir, outdir, rotation, trimStart, trimEnd, accurate }) {
+  const complete = groups
+    .map(g => ({
+      safe: sanitizeFilename(g.name) || "output",
+      refs: g.files.map(f => f.trim()).filter(Boolean).map(f => toInputRefSh(f)),
+    }))
+    .filter(g => g.refs.length > 0);
+
+  const blocks = complete
+    .map((g, i) => buildLocalSectionSh({ safe: g.safe, refs: g.refs, rotation, trimStart, trimEnd, idx: i + 1, accurate }))
+    .join("\n\n");
+
+  const footer = complete.length === 1
+    ? `echo\n${shSay(`Done! Output: ${complete[0].safe}.mp4`)}`
+    : `echo\necho "All done! ${complete.length} file(s) created in $OUTDIR"`;
+
+  return `${SH_PRELUDE}
+FFMPEG=${shPath(ffmpeg)}
+INDIR=${shPath(indir)}
+OUTDIR=${shPath(outdir)}
+
+mkdir -p "$OUTDIR"
+cd "$OUTDIR" || exit 1
+
+# Source files are read from $INDIR and never modified or deleted.
+
+${SH_ADD_FILE}
+
+${blocks}
+
+${footer}
+${SH_PAUSE}
+`;
+}
+
+function generateDumpSh({ playlistUrl, ytdlp }) {
+  return `${SH_PRELUDE}
+# Write playlist.txt next to this script, wherever it was launched from.
+cd "$(dirname "$0")" || exit 1
+
+YTDLP=${shPath(ytdlp)}
+PLAYLIST=${shsq(playlistUrl)}
+
+echo "Fetching playlist video list..."
+"$YTDLP" --flat-playlist --print "%(playlist_index)s ||| %(url)s ||| %(title)s" "$PLAYLIST" > playlist.txt
+
+echo
+echo "Done. Open playlist.txt (next to this script), copy everything, and paste it back into Joinr."
+${SH_PAUSE}
+`;
+}
+
+function generateJoinSh({ jobs, items, ytdlp, ffmpeg, outdir, accurate }) {
+  const active = jobs
+    .filter(j => !j.excluded)
+    .map(j => ({ name: j.name, items: items.filter(it => it.jobId === j.id) }))
+    .filter(j => j.items.length > 0);
+
+  const joinCodec = accurate ? ENCODE_ARGS : "-c copy";
+
+  const blocks = active.map((job, ji) => {
+    const safe = sanitizeFilename(job.name) || `output_${ji + 1}`;
+    const single = job.items.length === 1;
+    const header = `# ===== Job ${ji + 1}: ${safe} (${single ? "single" : job.items.length + " parts"}) =====`;
+
+    if (single) {
+      return `${header}
+${shSay(`=== Downloading: ${safe} ===`)}
+${dlLineWithCheckSh(`${safe}.mp4`, job.items[0].url)}`;
+    }
+
+    const dl = job.items.map((it, i) => dlLineWithCheckSh(`${safe} p${i + 1}.mp4`, it.url)).join("\n");
+    const part = (i) => shq(`${safe} p${i + 1}.mp4`);
+    const addLines = job.items.map((_, i) => `add_file ${part(i)}`).join("\n");
+    const delParts = job.items.map((_, i) => part(i)).join(" ");
+    const joinLabel = accurate ? "Joining and re-encoding (may take several minutes)" : "Joining";
+
+    return `${header}
+${shSay(`=== Downloading ${job.items.length} parts: ${safe} ===`)}
+${dl}
+${shSay(`=== ${joinLabel}: ${safe} ===`)}
+: > filelist.txt
+${addLines}
+"$FFMPEG" -f concat -safe 0 -i filelist.txt ${joinCodec} ${shq(`${safe}.mp4`)}
+rm -f filelist.txt
+rm -f ${delParts}`;
+  }).join("\n\n");
+
+  return `${SH_PRELUDE}
+YTDLP=${shPath(ytdlp)}
+FFMPEG=${shPath(ffmpeg)}
+OUTDIR=${shPath(outdir)}
+
+mkdir -p "$OUTDIR"
+cd "$OUTDIR" || exit 1
+
+FMT='bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
+
+${SH_ADD_FILE}
+
+${blocks}
+
+echo
+echo "All done! ${active.length} file(s) created in $OUTDIR"
+${SH_PAUSE}
+`;
+}
+
 // ─── Shared UI bits ───────────────────────────────────────────────────────────
 
 const sectionLabel = {
@@ -492,7 +869,7 @@ const sectionLabel = {
   textTransform: "uppercase", letterSpacing: "0.06em", display: "block",
 };
 
-function OutputPanel({ filename, content }) {
+function OutputPanel({ filename, content, ext = ".bat" }) {
   const [copied, setCopied] = useState(false);
   const copy = () =>
     navigator.clipboard.writeText(content).then(() => {
@@ -513,9 +890,15 @@ function OutputPanel({ filename, content }) {
           <button
             onClick={() => downloadText(filename, content)}
             style={{ padding: "5px 12px", fontSize: 12, borderRadius: 6, border: "none", background: "linear-gradient(135deg, #6366f1, #818cf8)", color: "#fff", cursor: "pointer", fontWeight: 700 }}
-          >⬇ Download .bat</button>
+          >⬇ Download {ext}</button>
         </div>
       </div>
+      {ext === ".command" && (
+        <p style={{ margin: 0, padding: "10px 16px", fontSize: 11.5, color: "#94a3b8", borderBottom: "1px solid #1e293b", lineHeight: 1.6 }}>
+          Run it in Terminal: <code style={{ color: "#a5b4fc" }}>bash ~/Downloads/"{filename}"</code>{" "}
+          (or <code style={{ color: "#a5b4fc" }}>chmod +x</code> it once, then double-click it).
+        </p>
+      )}
       <pre style={{ margin: 0, padding: 16, fontSize: 11, fontFamily: "monospace", color: "#94a3b8", overflowX: "auto", lineHeight: 1.6, maxHeight: 320, overflowY: "auto", whiteSpace: "pre" }}>
         {content}
       </pre>
@@ -574,8 +957,37 @@ function TimeInput({ label, value, onChange, placeholder }) {
   );
 }
 
+// Toggle between fast stream copy and a clean re-encode for joins / trims.
+function AccurateToggle({ accurate, onChange }) {
+  return (
+    <label style={{
+      display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 16,
+      padding: "12px 14px", borderRadius: 10, border: "1px solid",
+      borderColor: accurate ? "#c7d2fe" : "#e5e7eb",
+      background: accurate ? "#eef2ff" : "#f8fafc", cursor: "pointer",
+    }}>
+      <input
+        type="checkbox"
+        checked={accurate}
+        onChange={e => onChange(e.target.checked)}
+        style={{ width: 16, height: 16, marginTop: 2, cursor: "pointer", flexShrink: 0 }}
+      />
+      <span>
+        <span style={{ fontSize: 13, fontWeight: 700, color: "#374151", display: "block" }}>
+          Accurate join (re-encode)
+        </span>
+        <span style={{ fontSize: 11.5, color: "#6b7280", lineHeight: 1.5, display: "block", marginTop: 2 }}>
+          {accurate
+            ? "Rebuilds timestamps with libx264, which fixes video freezing after the join and makes trims frame-accurate. Slower: expect several minutes per hour of video."
+            : "Fast stream copy, no quality loss. Can leave the video frozen after the join when the parts have mismatched timestamps."}
+        </span>
+      </span>
+    </label>
+  );
+}
+
 // Rotation + trim controls, shared by Links and Local modes.
-function TransformPanel({ rotation, setRotation, trimStart, setTrimStart, trimEnd, setTrimEnd, onChange, multi }) {
+function TransformPanel({ rotation, setRotation, trimStart, setTrimStart, trimEnd, setTrimEnd, onChange, multi, accurate }) {
   const timesValid = isValidTime(trimStart) && isValidTime(trimEnd);
   return (
     <div style={{ marginBottom: 16, padding: "14px 16px", background: "#f8fafc", borderRadius: 10, border: "1px solid #e5e7eb" }}>
@@ -616,7 +1028,11 @@ function TransformPanel({ rotation, setRotation, trimStart, setTrimStart, trimEn
           <p style={{ margin: "7px 0 0", fontSize: 11, color: "#f87171" }}>Use M:SS or H:MM:SS (e.g. 1:30 or 0:01:30)</p>
         )}
         {(trimStart || trimEnd) && timesValid && rotation === "none" && (
-          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#6b7280" }}>Trim without rotation uses stream copy — cuts at nearest keyframe</p>
+          <p style={{ margin: "7px 0 0", fontSize: 11, color: "#6b7280" }}>
+            {accurate
+              ? "Accurate join is on — the trim is re-encoded, so cuts land on the exact frame"
+              : "Trim without rotation uses stream copy — cuts at nearest keyframe"}
+          </p>
         )}
       </div>
     </div>
@@ -787,10 +1203,14 @@ export default function App() {
   const [mode, setMode] = useState("links");
 
   // Shared
-  const [ytdlp, setYtdlp]   = useState(DEFAULT_YTDLP);
-  const [ffmpeg, setFfmpeg] = useState(DEFAULT_FFMPEG);
-  const [outdir, setOutdir] = useState(DEFAULT_OUTDIR);
+  const [platform, setPlatform] = useState(detectPlatform);
+  const scriptExt = SCRIPT_EXT[platform];
+  const [ytdlp, setYtdlp]   = useState(() => DEFAULTS[detectPlatform()].ytdlp);
+  const [ffmpeg, setFfmpeg] = useState(() => DEFAULTS[detectPlatform()].ffmpeg);
+  const [outdir, setOutdir] = useState(() => DEFAULTS[detectPlatform()].outdir);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // On by default: re-encode joins/trims so timestamps are rebuilt cleanly.
+  const [accurate, setAccurate] = useState(true);
 
   // Links mode — a list of videos, each with its own name + parts
   const [groups, setGroups]       = useState([newGroup()]);
@@ -800,7 +1220,7 @@ export default function App() {
   const [linksBat, setLinksBat]   = useState(null);
 
   // Local mode — files already on the machine
-  const [indir, setIndir]                   = useState(DEFAULT_INDIR);
+  const [indir, setIndir]                   = useState(() => DEFAULTS[detectPlatform()].indir);
   const [localGroups, setLocalGroups]       = useState([newLocalGroup()]);
   const [localRotation, setLocalRotation]   = useState("none");
   const [localTrimStart, setLocalTrimStart] = useState("");
@@ -839,11 +1259,11 @@ export default function App() {
 
   const firstCompleteIdx = statuses.findIndex(s => s.complete);
   const linksFilename = completeCount === 1 && firstCompleteIdx >= 0
-    ? `${sanitizeFilename(groups[firstCompleteIdx].name) || "output"}_download_join.bat`
-    : "batch_download_join.bat";
+    ? `${sanitizeFilename(groups[firstCompleteIdx].name) || "output"}_download_join${scriptExt}`
+    : `batch_download_join${scriptExt}`;
 
   const handleGenerate = () =>
-    setLinksBat(generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd }));
+    setLinksBat(generateLinksBatch({ groups, ytdlp, ffmpeg, outdir, rotation, trimStart, trimEnd, accurate, platform }));
 
   const linksHint =
     completeCount === 0 ? "Each video needs a name and at least one valid YouTube URL" :
@@ -873,11 +1293,11 @@ export default function App() {
 
   const firstLocalCompleteIdx = localStatuses.findIndex(s => s.complete);
   const localFilename = localCompleteCount === 1 && firstLocalCompleteIdx >= 0
-    ? `${sanitizeFilename(localGroups[firstLocalCompleteIdx].name) || "output"}_join.bat`
-    : "batch_join_local.bat";
+    ? `${sanitizeFilename(localGroups[firstLocalCompleteIdx].name) || "output"}_join${scriptExt}`
+    : `batch_join_local${scriptExt}`;
 
   const handleGenerateLocal = () =>
-    setLocalBat(generateLocalBatch({ groups: localGroups, ffmpeg, indir, outdir, rotation: localRotation, trimStart: localTrimStart, trimEnd: localTrimEnd }));
+    setLocalBat(generateLocalBatch({ groups: localGroups, ffmpeg, indir, outdir, rotation: localRotation, trimStart: localTrimStart, trimEnd: localTrimEnd, accurate, platform }));
 
   const sameFolder =
     indir.trim() && outdir.trim() &&
@@ -891,7 +1311,7 @@ export default function App() {
 
   // ── Playlist handlers ──
   const invalidateJoin = () => setJoinBat(null);
-  const handleGenerateDump = () => setDumpBat(generateDumpBat({ playlistUrl: playlistUrl.trim(), ytdlp }));
+  const handleGenerateDump = () => setDumpBat(generateDumpBat({ playlistUrl: playlistUrl.trim(), ytdlp, platform }));
   const handleParse = () => {
     const videos = parsePastedList(pasted);
     const built = buildInitial(videos);
@@ -921,7 +1341,37 @@ export default function App() {
   };
   const activeJobs = jobs.filter(j => !j.excluded && items.some(it => it.jobId === j.id));
   const totalParts = items.filter(it => activeJobs.some(j => j.id === it.jobId)).length;
-  const handleGenerateJoin = () => setJoinBat(generateJoinBat({ jobs, items, ytdlp, ffmpeg, outdir }));
+  const handleGenerateJoin = () => setJoinBat(generateJoinBat({ jobs, items, ytdlp, ffmpeg, outdir, accurate, platform }));
+
+  // Toggling accurate mode changes every generated script, so clear them all.
+  const changeAccurate = (val) => {
+    setAccurate(val);
+    invalidateLinks();
+    invalidateLocal();
+    invalidateJoin();
+  };
+
+  // Switching platform swaps any path still at the old platform's default
+  // (so edited paths are kept) and clears every generated script.
+  const changePlatform = (next) => {
+    if (next === platform) return;
+    const from = DEFAULTS[platform];
+    const to = DEFAULTS[next];
+    setYtdlp(v  => v === from.ytdlp  ? to.ytdlp  : v);
+    setFfmpeg(v => v === from.ffmpeg ? to.ffmpeg : v);
+    setOutdir(v => v === from.outdir ? to.outdir : v);
+    setIndir(v  => v === from.indir  ? to.indir  : v);
+    setPlatform(next);
+    invalidateLinks();
+    invalidateLocal();
+    invalidateJoin();
+    setDumpBat(null);
+  };
+
+  const installName    = `install_ytdlp${scriptExt}`;
+  const updateName     = `update_ytdlp${scriptExt}`;
+  const installContent = platform === "mac" ? INSTALL_SH_CONTENT : INSTALL_BAT_CONTENT;
+  const updateContent  = platform === "mac" ? UPDATE_SH_CONTENT  : UPDATE_BAT_CONTENT;
 
   // ── Shared building blocks ──
   const modeButton = (val, label) => {
@@ -968,6 +1418,8 @@ export default function App() {
     </div>
   );
 
+  const accurateToggle = <AccurateToggle accurate={accurate} onChange={changeAccurate} />;
+
   return (
     <div style={{
       minHeight: "100vh",
@@ -984,8 +1436,25 @@ export default function App() {
             <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: "#f1f5f9", letterSpacing: "-0.3px" }}>Joinr</h1>
           </div>
           <p style={{ margin: 0, color: "#94a3b8", fontSize: 13.5 }}>
-            Paste YouTube links — or point at files on your machine — and get a .bat that joins, rotates, or trims them.
+            Paste YouTube links — or point at files on your machine — and get a script that joins, rotates, or trims them.
           </p>
+        </div>
+
+        {/* Platform switch */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+          <span style={{ fontSize: 11.5, fontWeight: 600, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.06em" }}>Script for</span>
+          <div style={{ display: "flex", gap: 4, padding: 3, background: "rgba(15,23,42,0.6)", border: "1px solid #1e293b", borderRadius: 10 }}>
+            {[["windows", "Windows (.bat)"], ["mac", "Mac (.command)"]].map(([val, label]) => {
+              const active = platform === val;
+              return (
+                <button
+                  key={val}
+                  onClick={() => changePlatform(val)}
+                  style={{ padding: "5px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer", border: "none", borderRadius: 7, background: active ? "linear-gradient(135deg, #6366f1, #818cf8)" : "transparent", color: active ? "#fff" : "#94a3b8", transition: "all 0.15s" }}
+                >{label}</button>
+              );
+            })}
+          </div>
         </div>
 
         {/* Mode switch */}
@@ -1006,14 +1475,16 @@ export default function App() {
             </span>
             <span style={{ fontSize: 11.5, color: "#64748b", lineHeight: 1.5 }}>
               Download and run{" "}
-              <code style={{ color: "#a5b4fc", background: "rgba(99,102,241,0.15)", padding: "1px 5px", borderRadius: 4, fontSize: 11 }}>install_ytdlp.bat</code>
-              {" "}once — it auto-downloads both tools and adds them to your PATH.
+              <code style={{ color: "#a5b4fc", background: "rgba(99,102,241,0.15)", padding: "1px 5px", borderRadius: 4, fontSize: 11 }}>{installName}</code>
+              {" "}once — {platform === "mac"
+                ? "it installs both tools with Homebrew (get Homebrew from brew.sh first if you don't have it)."
+                : "it auto-downloads both tools and adds them to your PATH."}
             </span>
           </div>
           <button
-            onClick={() => downloadText("install_ytdlp.bat", INSTALL_BAT_CONTENT)}
+            onClick={() => downloadText(installName, installContent)}
             style={{ padding: "8px 13px", fontSize: 12, fontWeight: 700, flexShrink: 0, borderRadius: 8, border: "1px solid rgba(99, 102, 241, 0.4)", background: "rgba(99, 102, 241, 0.15)", color: "#a5b4fc", cursor: "pointer", whiteSpace: "nowrap" }}
-          >⬇ install_ytdlp.bat</button>
+          >⬇ {installName}</button>
         </div>
 
         {/* Update banner — YouTube changes often enough that an old yt-dlp
@@ -1027,14 +1498,14 @@ export default function App() {
             </span>
             <span style={{ fontSize: 11.5, color: "#64748b", lineHeight: 1.5 }}>
               YouTube changes often enough that an old yt-dlp build breaks. Download and run{" "}
-              <code style={{ color: "#94a3b8", background: "rgba(148,163,184,0.15)", padding: "1px 5px", borderRadius: 4, fontSize: 11 }}>update_ytdlp.bat</code>
+              <code style={{ color: "#94a3b8", background: "rgba(148,163,184,0.15)", padding: "1px 5px", borderRadius: 4, fontSize: 11 }}>{updateName}</code>
               {" "}to update yt-dlp and ffmpeg to their latest versions.
             </span>
           </div>
           <button
-            onClick={() => downloadText("update_ytdlp.bat", UPDATE_BAT_CONTENT)}
+            onClick={() => downloadText(updateName, updateContent)}
             style={{ padding: "8px 13px", fontSize: 12, fontWeight: 700, flexShrink: 0, borderRadius: 8, border: "1px solid rgba(148, 163, 184, 0.35)", background: "rgba(148, 163, 184, 0.12)", color: "#cbd5e1", cursor: "pointer", whiteSpace: "nowrap" }}
-          >⬇ update_ytdlp.bat</button>
+          >⬇ {updateName}</button>
         </div>
 
         {/* ─── LINKS MODE ─── */}
@@ -1072,8 +1543,10 @@ export default function App() {
                 rotation={rotation} setRotation={setRotation}
                 trimStart={trimStart} setTrimStart={setTrimStart}
                 trimEnd={trimEnd} setTrimEnd={setTrimEnd}
-                onChange={invalidateLinks} multi={multi}
+                onChange={invalidateLinks} multi={multi} accurate={accurate}
               />
+
+              {accurateToggle}
 
               {pathsAdvanced}
 
@@ -1089,7 +1562,7 @@ export default function App() {
               )}
             </div>
 
-            {linksBat && <OutputPanel filename={linksFilename} content={linksBat} />}
+            {linksBat && <OutputPanel filename={linksFilename} content={linksBat} ext={scriptExt} />}
           </>
         )}
 
@@ -1108,7 +1581,7 @@ export default function App() {
                   type="text"
                   value={indir}
                   onChange={e => { setIndir(e.target.value); invalidateLocal(); }}
-                  placeholder="C:\Videos"
+                  placeholder={DEFAULTS[platform].indir}
                   style={{ display: "block", width: "100%", boxSizing: "border-box", padding: "9px 12px", fontSize: 13, fontFamily: "monospace", border: "1.5px solid #d1d5db", borderRadius: 8, outline: "none", background: "#fafafa", color: "#111" }}
                 />
                 {sameFolder && (
@@ -1149,8 +1622,10 @@ export default function App() {
                 rotation={localRotation} setRotation={setLocalRotation}
                 trimStart={localTrimStart} setTrimStart={setLocalTrimStart}
                 trimEnd={localTrimEnd} setTrimEnd={setLocalTrimEnd}
-                onChange={invalidateLocal} multi={localMulti}
+                onChange={invalidateLocal} multi={localMulti} accurate={accurate}
               />
+
+              {accurateToggle}
 
               {pathsAdvanced}
 
@@ -1166,7 +1641,7 @@ export default function App() {
               )}
             </div>
 
-            {localBat && <OutputPanel filename={localFilename} content={localBat} />}
+            {localBat && <OutputPanel filename={localFilename} content={localBat} ext={scriptExt} />}
           </>
         )}
 
@@ -1181,7 +1656,7 @@ export default function App() {
                   <span style={{ color: "#6366f1" }}>Step 1</span> · List the playlist
                 </span>
                 <p style={{ margin: "0 0 10px", fontSize: 12, color: "#6b7280", lineHeight: 1.5 }}>
-                  Paste a playlist URL. This makes a small <code style={{ fontSize: 11, background: "#f1f5f9", padding: "1px 5px", borderRadius: 4 }}>dump_playlist.bat</code> that
+                  Paste a playlist URL. This makes a small <code style={{ fontSize: 11, background: "#f1f5f9", padding: "1px 5px", borderRadius: 4 }}>dump_playlist{scriptExt}</code> that
                   writes every video's title + link to <code style={{ fontSize: 11, background: "#f1f5f9", padding: "1px 5px", borderRadius: 4 }}>playlist.txt</code>.
                 </p>
                 <input
@@ -1195,10 +1670,10 @@ export default function App() {
                   onClick={handleGenerateDump}
                   disabled={!playlistUrl.trim()}
                   style={{ width: "100%", padding: "9px 0", fontSize: 13, fontWeight: 700, borderRadius: 8, border: "none", cursor: playlistUrl.trim() ? "pointer" : "not-allowed", background: playlistUrl.trim() ? "#eef2ff" : "#f3f4f6", color: playlistUrl.trim() ? "#4338ca" : "#9ca3af" }}
-                >Make dump_playlist.bat</button>
+                >Make dump_playlist{scriptExt}</button>
               </div>
 
-              {dumpBat && <OutputPanel filename="dump_playlist.bat" content={dumpBat} />}
+              {dumpBat && <OutputPanel filename={`dump_playlist${scriptExt}`} content={dumpBat} ext={scriptExt} />}
 
               {/* Step 2 */}
               <div style={{ marginTop: dumpBat ? 22 : 0, marginBottom: 22 }}>
@@ -1206,7 +1681,7 @@ export default function App() {
                   <span style={{ color: "#6366f1" }}>Step 2</span> · Paste playlist.txt back
                 </span>
                 <p style={{ margin: "0 0 10px", fontSize: 12, color: "#6b7280", lineHeight: 1.5 }}>
-                  Run the .bat, open <code style={{ fontSize: 11, background: "#f1f5f9", padding: "1px 5px", borderRadius: 4 }}>playlist.txt</code>, copy everything, and paste it here.
+                  Run the script, open <code style={{ fontSize: 11, background: "#f1f5f9", padding: "1px 5px", borderRadius: 4 }}>playlist.txt</code>, copy everything, and paste it here.
                 </p>
                 <textarea
                   value={pasted}
@@ -1258,6 +1733,8 @@ export default function App() {
                         style={{ width: "100%", padding: "7px 14px", fontSize: 12.5, border: "1.5px dashed #c4b5fd", borderRadius: 8, background: "#faf5ff", color: "#7c3aed", cursor: "pointer", fontWeight: 600, marginBottom: 18 }}
                       >+ Add empty group</button>
 
+                      {accurateToggle}
+
                       {pathsAdvanced}
 
                       <button
@@ -1276,14 +1753,14 @@ export default function App() {
               )}
             </div>
 
-            {joinBat && <OutputPanel filename="playlist_download_join.bat" content={joinBat} />}
+            {joinBat && <OutputPanel filename={`playlist_download_join${scriptExt}`} content={joinBat} ext={scriptExt} />}
           </>
         )}
 
         <p style={{ marginTop: 16, fontSize: 11, color: "#475569", textAlign: "center" }}>
           {mode === "local"
-            ? "Requires ffmpeg · Works on files already on your machine · Originals never deleted · Joins use stream copy unless rotating"
-            : "Requires yt-dlp + ffmpeg · One file per video · Joins use stream copy unless rotating"}
+            ? `Requires ffmpeg · Works on files already on your machine · Originals never deleted · ${accurate ? "Joins re-encode (accurate mode)" : "Joins use stream copy unless rotating"}`
+            : `Requires yt-dlp + ffmpeg · One file per video · ${accurate ? "Joins re-encode (accurate mode)" : "Joins use stream copy unless rotating"}`}
         </p>
 
       </div>
